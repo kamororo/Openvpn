@@ -266,14 +266,28 @@ object TunnelBear {
         } catch (_: Exception) { DEFAULT_COUNTRY }
     }
 
+    /** True only when the stored value is a REAL
+     *  country from the 47-country list (v1.5: the
+     *  old upgrade adoption saved the raw entry name
+     *  "TunnelBear" as tb_country, so a bare
+     *  non-blank check is not enough — anything not
+     *  in the list counts as unpicked, and the chip
+     *  reads «انتخاب کشور»). */
+    fun isKnownCountry(ctx: Context, country: String): Boolean {
+        return try {
+            countries(ctx).any { it.equals(country.trim(), ignoreCase = true) }
+        } catch (_: Exception) { false }
+    }
+
     /** True when the user has explicitly picked a
      *  country (v1.2: until then the chip reads
      *  «انتخاب کشور» and the log uses the bare
      *  display name). */
     fun hasSelectedCountry(ctx: Context): Boolean {
         return try {
-            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getString(KEY_COUNTRY, null)?.isNotBlank() == true
+            val stored = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_COUNTRY, null)
+            stored?.isNotBlank() == true && isKnownCountry(ctx, stored)
         } catch (_: Exception) { false }
     }
 
@@ -334,12 +348,29 @@ object TunnelBear {
             val sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val stored = OvpnStore.load(ctx)
             val tb = stored.filter { it.tunnelBear }
+            // v1.5 HEAL: a stored tb_country that is not
+            // a real country (the old adoption saved the
+            // raw entry name "TunnelBear") is removed, so
+            // existing installs show «انتخاب کشور» again
+            // with no reinstall. Only real 47-list
+            // countries survive.
+            val storedCountry = sp.getString(KEY_COUNTRY, null)
+            if (storedCountry != null && !isKnownCountry(ctx, storedCountry)) {
+                sp.edit().remove(KEY_COUNTRY).apply()
+            }
             // Upgrade adoption: no country picked yet —
             // keep the country the user already had.
             if (sp.getString(KEY_COUNTRY, null) == null && tb.isNotEmpty()) {
                 val last = sp.getString("ovpn_last", null)
                 val pick = tb.firstOrNull { it.name == last } ?: tb.sortedBy { it.name }.first()
-                saveSelectedCountry(ctx, countryName(pick.name))
+                // v1.5: adopt ONLY a real country.
+                // countryName() of the bare single-entry
+                // name "TunnelBear" is "TunnelBear" itself
+                // — saving it made the chip show the raw
+                // entry name. Anything not in the 47-list
+                // is left unpicked.
+                val adopted = countryName(pick.name)
+                if (isKnownCountry(ctx, adopted)) saveSelectedCountry(ctx, adopted)
                 if (last != null && last.startsWith("TunnelBear ")) {
                     sp.edit().putString("ovpn_last", SINGLE_NAME).apply()
                 }

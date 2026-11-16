@@ -26,17 +26,19 @@ import android.view.animation.LinearInterpolator
 import android.widget.*
 
 /**
- * Standalone Openvpn app v1.4 — the OpenVPN section of Config
+ * Standalone Openvpn app v1.5 — the OpenVPN section of Config
  * Renamer, alone. Opens DIRECTLY into this page: no calculator
  * disguise, no lock, no PIN. Design = approved mockup v4, as
  * revised by the v1.1 order and the v1.2 fixes: channel-logo
  * header + ☰ at the top-LEFT opening a LEFT side drawer (log,
  * guide, day/night, language fa/en/ru, about), two tabs (Free
  * open vpn / Open vpn), one round glass connect orb (14s ring +
- * 40s dashed ring + glow). v1.4 changes ONLY the launcher icon:
- * the circle is scaled to the 66dp adaptive-icon safe zone (v1.3
- * filled the whole layer and the launcher mask cropped the rim
- * and the «اینترنت آزاد» text). NO status pill under the orb, NO
+ * 40s dashed ring + glow). v1.5 changes ONLY the country-chip
+ * name leak: the old upgrade adoption saved the raw entry name
+ * "TunnelBear" as the picked country, so the chip showed it;
+ * now adoption saves only real 47-list countries, a stored
+ * non-country value is healed away on launch, and every
+ * country display goes through the known-country guard. NO status pill under the orb, NO
  * «TunnelBear» anywhere user-visible (log included), NO on-page
  * connect-error text (log only). Free tab: the orb IS the free
  * flow — one tap creates TWO accounts in the background (first
@@ -1130,8 +1132,13 @@ class OpenVpnActivity : Activity() {
                     orbSmall?.text = OvpnEngine.lastState ?: ""
                 } else {
                     orbBig?.text = if (connected) L("توقف", "Stop") else L("اتصال", "Connect")
-                    orbSmall?.text = if (connected) L("متصل — ", "Connected — ") + TunnelBear.displayCountry(country)
-                        else L("برای اتصال روی دایره بزن", "Tap the circle to connect")
+                    // v1.5: the country suffix only when a real
+                    // country is picked — never the raw entry
+                    // name, never an unpicked default.
+                    orbSmall?.text = if (connected) {
+                        if (TunnelBear.hasSelectedCountry(this)) L("متصل — ", "Connected — ") + TunnelBear.displayCountry(country)
+                        else L("متصل", "Connected")
+                    } else L("برای اتصال روی دایره بزن", "Tap the circle to connect")
                 }
                 countryChip?.visibility = View.VISIBLE
                 // v1.2: the chip NEVER shows a provider
@@ -1175,7 +1182,11 @@ class OpenVpnActivity : Activity() {
         sl.setTextColor(OvpnTheme.subFg(this))
         if (tab == "free") {
             if (connected) {
-                sl.text = L("متصل به ", "Connected to ") + TunnelBear.displayCountry(TunnelBear.selectedCountry(this))
+                // v1.5: country only when a real country is
+                // picked (same guard as the chip).
+                sl.text = if (TunnelBear.hasSelectedCountry(this))
+                    L("متصل به ", "Connected to ") + TunnelBear.displayCountry(TunnelBear.selectedCountry(this))
+                else L("متصل", "Connected")
             } else if (connecting && OvpnEngine.activeName == TunnelBear.SINGLE_NAME) {
                 sl.text = L("در حال اتصال به «", "Connecting to “") + TunnelBear.DISPLAY_NAME + "»…"
             } else if (anyConnected) {
@@ -1490,12 +1501,16 @@ class OpenVpnActivity : Activity() {
         // PLACE and never re-sort while the list is open.
         val countries = sortedTbCountries()
         val country = TunnelBear.selectedCountry(this)
+        // v1.5: a row is marked selected only when a real
+        // country was picked (same guard as the chip) —
+        // the unpicked default must not checkmark any row.
+        val hasPick = TunnelBear.hasSelectedCountry(this)
         val menuList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = rtlDir()
         }
         for (c in countries) {
-            val isSel = c.equals(country, ignoreCase = true)
+            val isSel = hasPick && c.equals(country, ignoreCase = true)
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL

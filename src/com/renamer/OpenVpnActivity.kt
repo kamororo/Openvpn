@@ -26,14 +26,17 @@ import android.view.animation.LinearInterpolator
 import android.widget.*
 
 /**
- * Standalone Openvpn app v1.3 — the OpenVPN section of Config
+ * Standalone Openvpn app v1.4 — the OpenVPN section of Config
  * Renamer, alone. Opens DIRECTLY into this page: no calculator
  * disguise, no lock, no PIN. Design = approved mockup v4, as
  * revised by the v1.1 order and the v1.2 fixes: channel-logo
  * header + ☰ at the top-LEFT opening a LEFT side drawer (log,
  * guide, day/night, language fa/en/ru, about), two tabs (Free
  * open vpn / Open vpn), one round glass connect orb (14s ring +
- * 40s dashed ring + glow). NO status pill under the orb, NO
+ * 40s dashed ring + glow). v1.4 changes ONLY the launcher icon:
+ * the circle is scaled to the 66dp adaptive-icon safe zone (v1.3
+ * filled the whole layer and the launcher mask cropped the rim
+ * and the «اینترنت آزاد» text). NO status pill under the orb, NO
  * «TunnelBear» anywhere user-visible (log included), NO on-page
  * connect-error text (log only). Free tab: the orb IS the free
  * flow — one tap creates TWO accounts in the background (first

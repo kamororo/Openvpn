@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.renamer.openvpn"
+    android:versionCode="3"
+    android:versionName="1.2">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="36" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- v1.2: let the app resolve the Telegram app for
+         the About channel link (tg:// + https targeted
+         at the Telegram packages) on Android 11+. -->
+    <queries>
+        <package android:name="org.telegram.messenger" />
+        <package android:name="org.thunderdog.challegram" />
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="tg" />
+        </intent>
+    </queries>
+    <application android:label="Openvpn" android:icon="@mipmap/ic_launcher" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity android:name="com.renamer.OpenVpnActivity" android:exported="true" android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name="com.renamer.OpenVpnImportActivity" android:exported="false" android:screenOrientation="portrait" />
+        <!-- OpenVPN3 engine's own VpnService. It runs the OpenVPN3
+             core in-process and builds the TUN through the TunBuilder
+             callbacks, exactly like the official OpenVPN Connect app. -->
+        <service android:name="com.renamer.Ovpn3VpnService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+        <!-- Official ics-openvpn core's own VpnService.
+             OpenVpnApi starts it, and it builds the TUN and runs
+             the native openvpn binary, exactly like the official
+             OpenVPN Connect app. -->
+        <service android:name="de.blinkt.openvpn.core.OpenVPNService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+        <!-- Activities the ics-openvpn notification refers to
+             (disconnect action, user input). Without them, tapping
+             the notification action would fail. -->
+        <activity android:name="de.blinkt.openvpn.DisconnectVPNActivity"
+            android:exported="false"
+            android:theme="@style/blinkt.dialog" />
+        <activity android:name="de.blinkt.openvpn.LaunchVPN"
+            android:exported="false" />
+        <service android:name="de.blinkt.openvpn.core.OpenVPNStatusService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:exported="false" />
+    </application>
+</manifest>

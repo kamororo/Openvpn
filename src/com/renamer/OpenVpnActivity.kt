@@ -26,7 +26,7 @@ import android.view.animation.LinearInterpolator
 import android.widget.*
 
 /**
- * Standalone Openvpn app v1.2 — the OpenVPN section of Config
+ * Standalone Openvpn app v1.3 — the OpenVPN section of Config
  * Renamer, alone. Opens DIRECTLY into this page: no calculator
  * disguise, no lock, no PIN. Design = approved mockup v4, as
  * revised by the v1.1 order and the v1.2 fixes: channel-logo
@@ -926,13 +926,28 @@ class OpenVpnActivity : Activity() {
             gravity = Gravity.START
             setPadding(0, 0, 0, dp(12))
         })
-        // v1.2: label + channel ID on ONE line, the ID
-        // underlined as a link. The v1.1 two-TextView row
-        // wrapped the ID to two lines («@internet_azad» /
-        // «_2026»). One TextView, single line, and the text
-        // shrinks (down to 12sp) until the whole line fits
-        // the card — measured at runtime, so it holds on
-        // any screen width.
+        // v1.3: ROOT CAUSE of the v1.2 invisible row —
+        // setSingleLine(true) switches the TextView to
+        // horizontal-scrolling mode; with textDirection
+        // RTL (fa) on a WRAP_CONTENT-width view inside
+        // the RTL card, the single-line layout scrolls
+        // the mixed RTL+Latin line out of the visible
+        // viewport — the view keeps its measured height
+        // (the empty gap in the screenshot) while no
+        // glyph draws. The post-layout textSize-mutation
+        // loop compounded it by re-triggering layout
+        // after placement. v1.1's two-TextView row (no
+        // setSingleLine, no LinkMovementMethod, no post
+        // mutation) RENDERED on device. Fix: plain
+        // single TextView, NO setSingleLine, NO
+        // LinkMovementMethod, NO ClickableSpan, NO
+        // post-layout mutation. The ID keeps its link
+        // look (underline + bold + accent) via visual
+        // spans only; the whole row is clickable and
+        // opens the Telegram channel. If the line is
+        // too long for a narrow screen it WRAPS to two
+        // lines (as v1.1 did) rather than vanishing —
+        // VISIBILITY BEATS ONE-LINE.
         val channelId = "@internet_azad_2026"
         val channelLabel = T("کانال تلگرام و ارتباط با ما: ",
             "Telegram channel and contact: ",
@@ -942,7 +957,6 @@ class OpenVpnActivity : Activity() {
             setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
             textDirection = appTextDir()
             gravity = Gravity.START
-            setSingleLine(true)
             setPadding(0, dp(10), 0, dp(10))
             val span = android.text.SpannableStringBuilder().apply {
                 append(channelLabel)
@@ -952,37 +966,13 @@ class OpenVpnActivity : Activity() {
                     android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 setSpan(android.text.style.StyleSpan(android.graphics.Typeface.BOLD), start, length,
                     android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                setSpan(object : android.text.style.ClickableSpan() {
-                    override fun onClick(widget: View) { openTelegramChannel() }
-                    override fun updateDrawState(ds: android.text.TextPaint) {
-                        super.updateDrawState(ds)
-                        ds.color = OvpnTheme.accent(this@OpenVpnActivity)
-                        ds.isUnderlineText = true
-                    }
-                }, start, length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                setSpan(android.text.style.ForegroundColorSpan(OvpnTheme.accent(this@OpenVpnActivity)),
+                    start, length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
             text = span
-            movementMethod = android.text.method.LinkMovementMethod.getInstance()
-            highlightColor = Color.TRANSPARENT
+            setOnClickListener { openTelegramChannel() }
         }
         card.addView(channelView)
-        channelView.post {
-            try {
-                val avail = (card.width - card.paddingLeft - card.paddingRight).toFloat()
-                var guard = 0
-                while (guard++ < 8 && avail > 0) {
-                    val labelW = channelView.paint.measureText(channelLabel)
-                    val boldPaint = android.text.TextPaint(channelView.paint).apply {
-                        typeface = android.graphics.Typeface.create(channelView.typeface, android.graphics.Typeface.BOLD)
-                    }
-                    val idW = boldPaint.measureText(channelId)
-                    if (labelW + idW <= avail) break
-                    val sp = channelView.textSize / resources.displayMetrics.density - 0.5f
-                    if (sp < 12f) break
-                    channelView.textSize = sp
-                }
-            } catch (_: Exception) {}
-        }
         card.addView(TextView(this).apply {
             text = L("بستن", "Close")
             textSize = 15f
@@ -1230,6 +1220,18 @@ class OpenVpnActivity : Activity() {
         }
         return name ?: ""
     }
+
+    /** v1.3: DISPLAY-time mapping for old log lines. The
+     *  v1.2 write-time mapping (logDisplayName) only fixes
+     *  NEW lines; lines written by v1.1 still carry the raw
+     *  stored name. The stored log is append-only history
+     *  and is never rewritten — instead, each line is
+     *  mapped when rendered, so old lines read as
+     *  «Free OpenVpn config» (no country suffix — the
+     *  country then is unknown). Applied in showLogDialog
+     *  only; the stored text is untouched. */
+    private fun displayLogLine(line: String): String =
+        line.replace(TunnelBear.SINGLE_NAME, TunnelBear.DISPLAY_NAME)
 
     private fun refreshStatus() {
         // Central-log flip detector (2.43): direct connects,
@@ -1530,6 +1532,10 @@ class OpenVpnActivity : Activity() {
                     TunnelBear.ensureSingleEntry(this@OpenVpnActivity)
                     profiles = OvpnStore.load(this@OpenVpnActivity)
                 } catch (_: Exception) {}
+                // v1.3: probe the picked country NOW (priority,
+                // ahead of the menu sweep) so its dot shows the
+                // fresh result right away.
+                probeCountryNow(c)
                 try { countryPopup?.dismiss() } catch (_: Exception) {}
                 countryPopup = null
                 tbCountryMenuOpen = false
@@ -1538,7 +1544,7 @@ class OpenVpnActivity : Activity() {
             }
             menuList.addView(row)
         }
-        startTbCountryProbe()
+        startTbCountryProbe(forceFresh = true)
         // Fixed-height scroll: ~5 rows visible, all 47
         // reachable.
         panel.addView(ScrollView(this).apply {
@@ -1563,29 +1569,27 @@ class OpenVpnActivity : Activity() {
         tbCountryMenuOpen = true
     }
 
-    /** Sort tier for one country, from the SESSION probe when
-     *  one exists (2nd green = AUTH + PUSH_REPLY with an IP),
-     *  else the probe cache + last 7 days of REAL dials:
-     *  0 = TLS green + session proven, 1 = TLS green, session
-     *  untested, 2 = TLS green + session failed, 3 = TLS not green.
+    /** Sort tier for one country — SAME order as
+     *  refreshTbCountryRow, so the sort agrees with the
+     *  dots: 0 = full session proven OR TLS healthy +
+     *  recent successful real dial, 1 = TLS healthy,
+     *  2 = TLS healthy but session/dial failed,
+     *  3 = TLS not healthy. A TLS-only session result
+     *  never hides a recent successful real dial.
      *  Alphabetical inside a tier. */
     private fun tbCountryTier(c: String): Int {
         val host = tbCountryHosts.getOrPut(c) { TunnelBear.remoteHostForCountry(this, c) ?: "" }
         val session = if (host.isBlank()) null else TunnelBear.cachedSession(this, host)
-        if (session != null) {
-            if (session.tls != 2) return 3
-            return when (session.session) {
-                1 -> 0
-                -1 -> 2
-                else -> 1
-            }
-        }
         val probe = if (host.isBlank()) null else TunnelBear.cachedProbe(this, host)
-        if (probe != 2) return 3
-        return when (TunnelBear.dialOutcome(this, c)) {
-            1 -> 0
-            -1 -> 2
-            else -> 1
+        val dial = TunnelBear.dialOutcome(this, c)
+        val tlsHealthy = (session != null && session.tls == 2) || probe == 2
+        return when {
+            session != null && session.tls == 2 && session.session == 1 -> 0
+            tlsHealthy && dial == 1 -> 0
+            session != null && session.tls == 2 && session.session == -1 -> 2
+            tlsHealthy && dial == -1 -> 2
+            tlsHealthy -> 1
+            else -> 3
         }
     }
 
@@ -1594,12 +1598,16 @@ class OpenVpnActivity : Activity() {
             .sortedWith(compareBy({ tbCountryTier(it) }, { it }))
     }
 
-    /** Paints one row's circles IN PLACE from the SESSION
-     *  probe when one exists (never re-sorts the open list).
-     *  Green = server TLS-healthy, second green = AUTH accepted
-     *  + PUSH_REPLY with an assigned IP, red = probe not
-     *  TLS-healthy, or green + red = healthy now but the session
-     *  failed; grey hollow = still testing / unknown. */
+    /** Paints one row's circles IN PLACE (never re-sorts
+     *  the open list). Green = server TLS-healthy; second
+     *  green = full session proven (AUTH + PUSH_REPLY with
+     *  an assigned IP) OR a recent successful REAL DIAL;
+     *  green + red = TLS healthy but the session failed
+     *  OR a recent real dial failed; red = TLS not healthy;
+     *  grey hollow = still testing / unknown. A TLS-only
+     *  session result NEVER hides a recent successful
+     *  real dial — the old order returned one green on
+     *  session=(2,0) before ever reaching the dial branch. */
     private fun refreshTbCountryRow(country: String) {
         val circles = tbCountryRowCircles[country] ?: return
         val host = tbCountryHosts.getOrPut(country) { TunnelBear.remoteHostForCountry(this, country) ?: "" }
@@ -1627,25 +1635,41 @@ class OpenVpnActivity : Activity() {
         circles.removeAllViews()
         val green = Color.parseColor("#43A047")
         val red = Color.parseColor("#D32F2F")
+        // v1.3: the dial outcome promotes/demotes the
+        // second dot whenever TLS is healthy. Order matters:
+        // a full session proof wins first; a TLS-only session
+        // result never hides a recent successful real dial.
+        val tlsHealthy = (session != null && session.tls == 2) || probe == 2
         when {
             session != null && session.tls == 2 && session.session == 1 -> { dot(green, false); dot(green, false) }
-            session != null && session.tls == 2 && session.session == 0 -> dot(green, false)
+            tlsHealthy && dial == 1 -> { dot(green, false); dot(green, false) }
             session != null && session.tls == 2 && session.session == -1 -> { dot(green, false); dot(red, false) }
-            session != null -> dot(red, false)
-            probe == 2 && dial == 1 -> { dot(green, false); dot(green, false) }
-            probe == 2 && dial == 0 -> dot(green, false)
-            probe == 2 && dial == -1 -> { dot(green, false); dot(red, false) }
-            probe == null -> dot(null, true)
-            else -> dot(red, false)
+            tlsHealthy && dial == -1 -> { dot(green, false); dot(red, false) }
+            tlsHealthy -> dot(green, false)
+            session != null || probe != null -> dot(red, false)
+            else -> dot(null, true)
         }
     }
 
-    /** Background re-probe of the stale / unknown countries on
-     *  a bounded 8-thread pool — the SESSION probe (TLS + AUTH
-     *  + PUSH), not just the TLS flight; each result is cached
-     *  (10 min TTL) and its row's circles are updated live.
-     *  Plain sockets only — never touches the VPN. */
-    private fun startTbCountryProbe() {
+    /** v1.3: fresh re-test of the listed countries on a
+     *  bounded 8-thread pool — the SESSION probe (TLS +
+     *  AUTH + PUSH), not just the TLS flight; each result
+     *  is cached (10 min TTL) and its row's circles are
+     *  updated live. Called on EVERY menu open with
+     *  forceFresh = true: countries with a fresh cached
+     *  verdict are re-probed anyway, so the dots show
+     *  whether each config connects on this internet
+     *  RIGHT NOW — never just the stale cache. The
+     *  10-min cache still governs the background
+     *  (page-entry) sweep. Skipped entirely while a VPN
+     *  is up (a probe through a live tunnel measures the
+     *  tunnel exit, not this line) and when no free
+     *  account exists yet (nothing to test — dots stay
+     *  grey hollow). Plain sockets only — never touches
+     *  the VPN. */
+    private fun startTbCountryProbe(forceFresh: Boolean = false) {
+        if (TunnelBear.getAccount(this) == null) return
+        if (anyVpnUp()) return
         val gen = ++tbCountryProbeGen
         try { tbCountryProbePool?.shutdownNow() } catch (_: Exception) {}
         val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
@@ -1653,7 +1677,7 @@ class OpenVpnActivity : Activity() {
         for (c in tbCountryRowCircles.keys.toList()) {
             val host = tbCountryHosts[c] ?: continue
             if (host.isBlank()) continue
-            if (TunnelBear.cachedSession(this, host) != null) continue
+            if (!forceFresh && TunnelBear.cachedSession(this, host) != null) continue
             pool.submit {
                 try {
                     TunnelBear.probeCountrySession(this@OpenVpnActivity, host)
@@ -1663,6 +1687,28 @@ class OpenVpnActivity : Activity() {
                 } catch (_: Exception) {}
             }
         }
+    }
+
+    /** v1.3: priority probe for the country the user just
+     *  picked in the menu — runs immediately on its own
+     *  thread, ahead of the menu sweep, so the fresh
+     *  result is in the cache right away (the next menu
+     *  open shows its dots instantly). Skipped with no
+     *  account or while a VPN is up. */
+    private fun probeCountryNow(country: String) {
+        if (TunnelBear.getAccount(this) == null) return
+        if (anyVpnUp()) return
+        val host = tbCountryHosts[country]
+            ?: TunnelBear.remoteHostForCountry(this, country) ?: return
+        if (host.isBlank()) return
+        Thread {
+            try {
+                TunnelBear.probeCountrySession(this@OpenVpnActivity, host)
+                handler.post {
+                    if (tbCountryMenuOpen) refreshTbCountryRow(country)
+                }
+            } catch (_: Exception) {}
+        }.start()
     }
 
     // ---------- connect ----------
@@ -1974,6 +2020,7 @@ class OpenVpnActivity : Activity() {
         val engineLog = OvpnEngine.logText()
         val appLog = try { AppLog.text(this) } catch (_: Exception) { "" }
         val kept = appLog.lines().filter { it.contains("[freeovpn]") || it.contains("[openvpn]") }
+            .map { displayLogLine(it) }
         val text = buildString {
             if (engineLog.isNotBlank()) append(engineLog)
             if (kept.isNotEmpty()) {

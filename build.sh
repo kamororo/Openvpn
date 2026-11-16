@@ -1,5 +1,5 @@
 #!/bin/bash
-# Standalone «Openvpn» app (v1.2, code 3) — the OpenVPN section of
+# Standalone «Openvpn» app (v1.3, code 4) — the OpenVPN section of
 # Config Renamer, alone. Adapted from the main app's build.sh:
 # same signing cert, same ovpn3/ics-openvpn engine chain, but NO
 # Xray / ZXing / WireGuard / Amnezia and no geoip/geosite.
@@ -48,8 +48,8 @@ public final class BuildConfig {
     public static final boolean DEBUG = false;
     public static final String BUILD_TYPE = "release";
     public static final String APPLICATION_ID = "com.renamer.openvpn";
-    public static final String VERSION_NAME = "1.2";
-    public static final int VERSION_CODE = 3;
+    public static final String VERSION_NAME = "1.3";
+    public static final int VERSION_CODE = 4;
 }
 EOF
 find $OVPN/java -name "*.java" > $OUT/ovpn_sources.txt

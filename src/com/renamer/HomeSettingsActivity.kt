@@ -4,9 +4,12 @@ import android.app.Activity
 import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.widget.*
+import java.io.File
 
 /** Settings page opened from the Home (apps) page.
  *  Each row opens one settings section; the sections
@@ -17,6 +20,324 @@ class HomeSettingsActivity : Activity() {
     // 2.80: the language section is collapsed by default; tapping its
     // header expands it, and picking a language recreates (collapsed again).
     private var langExpanded = false
+
+    // 1.75: the persistent update-download box (BELOW the
+    // «بررسی بروزرسانی» row). The box is rebuilt only when its
+    // identity changes (version + state + action); while a
+    // download runs, the 500 ms poll only moves the bar, so the
+    // box never flickers or loses its place.
+    private var downloadBoxSlot: LinearLayout? = null
+    private var downloadBoxView: LinearLayout? = null
+    private var downloadBoxBar: ProgressBar? = null
+    private var downloadBoxPercent: TextView? = null
+    private var downloadBoxState: TextView? = null
+    private var downloadBoxKey: String? = null
+    private val downloadBoxHandler = Handler(Looper.getMainLooper())
+    private var downloadBoxPolling = false
+    private val downloadBoxPoll = object : Runnable {
+        override fun run() {
+            if (!downloadBoxPolling) return
+            try {
+                refreshUpdateDownloadBox()
+            } catch (_: Exception) {
+            }
+            if (downloadBoxPolling) downloadBoxHandler.postDelayed(this, 500)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        try {
+            refreshUpdateDownloadBox()
+        } catch (_: Exception) {
+        }
+        downloadBoxPolling = true
+        downloadBoxHandler.removeCallbacks(downloadBoxPoll)
+        downloadBoxHandler.postDelayed(downloadBoxPoll, 500)
+    }
+
+    override fun onPause() {
+        downloadBoxPolling = false
+        try {
+            downloadBoxHandler.removeCallbacks(downloadBoxPoll)
+        } catch (_: Exception) {
+        }
+        super.onPause()
+    }
+
+    /** 1.75: (re)build or refresh the persistent download box
+     *  from the stored pending record. The box STAYS until the
+     *  new version is installed:
+     *   - DOWNLOADING + a live download -> live bar + percent.
+     *   - DOWNLOADING + NO live download -> the process died
+     *     mid-download: "interrupted", with a retry button.
+     *   - READY + file on disk, right size -> [نصب].
+     *   - FAILED -> [تلاش دوباره].
+     *   - No record, installed already, or a READY record whose
+     *     file is gone/wrong size -> no box (stale records are
+     *     cleared, never offered as a phantom install). */
+    private fun refreshUpdateDownloadBox() {
+        val slot = downloadBoxSlot ?: return
+        var pending = try {
+            UpdateChecker.loadPending(this)
+        } catch (_: Exception) {
+            null
+        }
+        if (pending != null) {
+            val installed = try {
+                UpdateChecker.installedVersionName(this)
+            } catch (_: Exception) {
+                ""
+            }
+            if (UpdateDownloadPure.shouldClearAsInstalled(installed, pending)) {
+                try {
+                    UpdateChecker.clearPending(this)
+                } catch (_: Exception) {
+                }
+                pending = null
+            }
+        }
+        if (pending == null) {
+            slot.visibility = View.GONE
+            if (downloadBoxView != null) {
+                slot.removeAllViews()
+                downloadBoxView = null
+                downloadBoxKey = null
+            }
+            return
+        }
+        val file = try {
+            UpdateChecker.pendingApkFile(this, pending)
+        } catch (_: Exception) {
+            null
+        }
+        val action = UpdateDownloadPure.resolveAction(
+            pending, file != null, file?.length() ?: 0L
+        )
+        if (action == UpdateDownloadPure.PendingAction.NONE) {
+            try {
+                UpdateChecker.clearPending(this)
+            } catch (_: Exception) {
+            }
+            slot.visibility = View.GONE
+            slot.removeAllViews()
+            downloadBoxView = null
+            downloadBoxKey = null
+            return
+        }
+        val live = UpdateChecker.liveDownloading &&
+            UpdateChecker.liveDownloadTag == pending.tag
+        val interrupted = pending.state == UpdateDownloadPure.PendingState.DOWNLOADING && !live
+        val key = pending.tag + "|" + pending.state.name + "|" + action.name + "|" + interrupted
+        if (downloadBoxView == null || downloadBoxKey != key) {
+            buildUpdateDownloadBox(slot, pending, action, interrupted, file)
+            downloadBoxKey = key
+        }
+        updateUpdateDownloadBoxProgress(pending, interrupted)
+        slot.visibility = View.VISIBLE
+    }
+
+    /** Build the box for one (version, state, action) — called
+     *  only when the key changes. Progress values are filled in
+     *  by [updateUpdateDownloadBoxProgress]. */
+    private fun buildUpdateDownloadBox(
+        slot: LinearLayout,
+        pending: UpdateDownloadPure.PendingDownload,
+        action: UpdateDownloadPure.PendingAction,
+        interrupted: Boolean,
+        file: File?
+    ) {
+        val fg = Theme.fg(this)
+        val subFg = Theme.subFg(this)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Theme.glassCard(this@HomeSettingsActivity, 18f)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(4), 0, dp(8)) }
+        }
+        val versionText = if (AppLanguage.isEnglish(this)) pending.tag
+        else SpeedTestPanelPure.faDigits(UpdateCheckerPure.displayVersion(pending.tag))
+            .replace('.', '٫')
+        box.addView(TextView(this).apply {
+            text = L("دانلود نسخه " + versionText, "Downloading version " + pending.tag)
+            textSize = 15f
+            setTypeface(android.graphics.Typeface.DEFAULT_BOLD)
+            setTextColor(fg)
+            textDirection = View.TEXT_DIRECTION_LOCALE
+            gravity = Gravity.START
+        })
+        val stateText = TextView(this).apply {
+            textSize = 13f
+            setTextColor(subFg)
+            textDirection = View.TEXT_DIRECTION_LOCALE
+            gravity = Gravity.START
+            setPadding(0, dp(4), 0, 0)
+        }
+        box.addView(stateText)
+        downloadBoxState = stateText
+        // Downloading: a progress bar + percent, IN THIS BOX.
+        val progressRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility =
+                if (action == UpdateDownloadPure.PendingAction.DOWNLOADING) View.VISIBLE
+                else View.GONE
+            setPadding(0, dp(12), 0, 0)
+        }
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val percentText = TextView(this).apply {
+            textSize = 13f
+            setTextColor(subFg)
+            setPadding(dp(8), 0, 0, 0)
+        }
+        progressRow.addView(bar)
+        progressRow.addView(percentText)
+        box.addView(progressRow)
+        downloadBoxBar = bar
+        downloadBoxPercent = percentText
+        // Ready: the file name, tap [نصب] to install.
+        if (action == UpdateDownloadPure.PendingAction.INSTALL) {
+            box.addView(TextView(this).apply {
+                text = UpdateCheckerPure.sanitizeApkName(pending.apkName)
+                textSize = 12f
+                setTextColor(subFg)
+                textDirection = View.TEXT_DIRECTION_LOCALE
+                gravity = Gravity.START
+                setPadding(0, dp(2), 0, 0)
+            })
+        }
+        // The action row: [نصب] when ready, [دانلود دوباره] when
+        // failed or interrupted, nothing while it downloads.
+        val buttons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = if (AppLanguage.isEnglish(this@HomeSettingsActivity))
+                View.LAYOUT_DIRECTION_LTR else View.LAYOUT_DIRECTION_RTL
+            setPadding(0, dp(12), 0, 0)
+        }
+        when (action) {
+            UpdateDownloadPure.PendingAction.INSTALL -> {
+                val target = file
+                buttons.addView(Button(this).apply {
+                    text = L("نصب", "Install")
+                    textSize = 15f
+                    textDirection = View.TEXT_DIRECTION_LOCALE
+                    setPadding(dp(20), dp(8), dp(20), dp(8))
+                    minimumWidth = dp(96)
+                    background = Theme.neonRect(this@HomeSettingsActivity, 14f)
+                    setTextColor(Theme.neonTextColor(this@HomeSettingsActivity))
+                    setOnClickListener {
+                        val f = target ?: return@setOnClickListener
+                        UpdateUi.installDownloaded(this@HomeSettingsActivity, f)
+                    }
+                })
+            }
+            UpdateDownloadPure.PendingAction.RETRY -> {
+                buttons.addView(Button(this).apply {
+                    text = L("تلاش دوباره", "Try again")
+                    textSize = 15f
+                    textDirection = View.TEXT_DIRECTION_LOCALE
+                    setPadding(dp(20), dp(8), dp(20), dp(8))
+                    minimumWidth = dp(96)
+                    background = Theme.neonRect(this@HomeSettingsActivity, 14f)
+                    setTextColor(Theme.neonTextColor(this@HomeSettingsActivity))
+                    setOnClickListener { retryUpdateDownload(pending) }
+                })
+            }
+            UpdateDownloadPure.PendingAction.DOWNLOADING -> {
+                if (interrupted) {
+                    buttons.addView(Button(this).apply {
+                        text = L("دانلود دوباره", "Download again")
+                        textSize = 15f
+                        textDirection = View.TEXT_DIRECTION_LOCALE
+                        setPadding(dp(20), dp(8), dp(20), dp(8))
+                        minimumWidth = dp(96)
+                        background = Theme.neonRect(this@HomeSettingsActivity, 14f)
+                        setTextColor(Theme.neonTextColor(this@HomeSettingsActivity))
+                        setOnClickListener { retryUpdateDownload(pending) }
+                    })
+                }
+            }
+            else -> {
+            }
+        }
+        if (buttons.childCount > 0) box.addView(buttons)
+        slot.removeAllViews()
+        slot.addView(box)
+        downloadBoxView = box
+    }
+
+    /** Move the bar + state line for the current progress. Live
+     *  numbers come from the running download when there is one;
+     *  otherwise the last saved counts in the pending record. */
+    private fun updateUpdateDownloadBoxProgress(
+        pending: UpdateDownloadPure.PendingDownload,
+        interrupted: Boolean
+    ) {
+        val live = UpdateChecker.liveDownloading &&
+            UpdateChecker.liveDownloadTag == pending.tag
+        val downloaded =
+            if (live) UpdateChecker.liveDownloaded else pending.downloadedBytes
+        val total =
+            if (live) UpdateChecker.liveTotal else pending.totalBytes
+        val percent = UpdateCheckerPure.percent(downloaded, total)
+        val bar = downloadBoxBar
+        val percentText = downloadBoxPercent
+        if (bar != null && percentText != null) {
+            if (percent < 0) {
+                bar.isIndeterminate = true
+                percentText.text = ""
+            } else {
+                bar.isIndeterminate = false
+                bar.progress = percent
+                percentText.text = if (AppLanguage.isEnglish(this)) "$percent%"
+                else SpeedTestPanelPure.faDigits(percent.toString()) + "٪"
+            }
+        }
+        downloadBoxState?.text = when {
+            interrupted -> L(
+                "دانلود ناتمام ماند؛ برای ادامه دوباره دانلود کن.",
+                "The download was interrupted; download again to continue."
+            )
+            pending.state == UpdateDownloadPure.PendingState.READY ->
+                L("دانلود شد — آماده نصب است", "Downloaded — ready to install")
+            pending.state == UpdateDownloadPure.PendingState.FAILED ->
+                L("دانلود ناموفق بود؛ دوباره تلاش کن.", "Download failed; try again.")
+            else -> L("در حال دانلود…", "Downloading…")
+        }
+    }
+
+    /** Restart a failed / interrupted download from scratch (a
+     *  half-written file is never resumed). The pending record
+     *  flips back to DOWNLOADING at once, so the box shows the
+     *  fresh progress on the next poll. */
+    private fun retryUpdateDownload(pending: UpdateDownloadPure.PendingDownload) {
+        val rel = pending.toRelease()
+        try {
+            UpdateChecker.downloadApk(
+                this, rel,
+                onProgress = { _, _, _ -> },
+                onDone = {
+                    try {
+                        refreshUpdateDownloadBox()
+                    } catch (_: Exception) {
+                    }
+                },
+                origin = pending.origin
+            )
+        } catch (_: Exception) {
+        }
+        try {
+            refreshUpdateDownloadBox()
+        } catch (_: Exception) {
+        }
+    }
 
     private fun L(fa: String, en: String): String = AppLanguage.t(this, fa, en)
 
@@ -139,27 +460,9 @@ setBackgroundColor(Theme.divider(this@HomeSettingsActivity))
             L("توضیح هر بخش، جدا جدا.", "Each section explained, one by one."),
             GuideActivity::class.java
         )
-        // 2.95: About Us — opens the app's Telegram channel.
-        // 2.96: the icon is an info circle, not a paper
-        // plane (a plane has nothing to do with About);
-        // the tap opens the system chooser titled "open
-        // with Telegram", so Telegram is offered when it
-        // is installed instead of the system silently
-        // picking a default handler.
-        settingRow(
-            "ⓘ", "229ED9",
-            L("درباره ما", "About us"),
-            L("کانال تلگرام برنامه", "The app's Telegram channel."),
-            null
-        ) {
-            try {
-                val view = Intent(Intent.ACTION_VIEW,
-                    android.net.Uri.parse("https://t.me/internet_azad_2026"))
-                startActivity(Intent.createChooser(view,
-                    L("باز کردن با تلگرام", "Open with Telegram")))
-            } catch (_: Exception) {}
-        }
-
+        // 1.75 (E): «درباره ما» moved to directly above
+        // «بررسی بروزرسانی» (the last option); it already existed,
+        // so it is only reordered, not recreated.
 
         // 2.79: language moved here from the Home top bar (the FA button is
         // gone). A separate section with the same two choices the FA sheet
@@ -272,13 +575,9 @@ setBackgroundColor(Theme.divider(this@HomeSettingsActivity))
         // 2.79: night/day toggle moved here from the Home top bar (the ☾
         // button is gone). Same behavior: flips the dark_mode pref and
         // recreates, like the old button did.
-        root.addView(TextView(this).apply {
-            text = L("ظاهر", "Appearance")
-            textSize = 15f
-            setTypeface(android.graphics.Typeface.DEFAULT_BOLD)
-            setTextColor(fg)
-            setPadding(dp(8), dp(16), dp(8), dp(4))
-        })
+        // 1.75 (D): the «ظاهر» section label above the night-mode
+        // row is deleted (user order); the night-mode row itself
+        // stays, directly under the language section.
         // 2.95: no on/off toggle anymore. The row opens an
         // app-styled menu (night / day / follow the phone);
         // the icon follows the choice (sun / moon / combined
@@ -334,6 +633,40 @@ setBackgroundColor(Theme.divider(this@HomeSettingsActivity))
             setTextColor(subFg)
         })
         root.addView(nightRow)
+        // 1.75 (E): «درباره ما» — directly above «بررسی بروزرسانی».
+        // It already existed (2.95, opens the app's Telegram channel);
+        // only its position changed. 2.96: the icon is an info
+        // circle, not a paper plane (a plane has nothing to do with
+        // About); the tap opens the system chooser titled "open with
+        // Telegram", so Telegram is offered when it is installed
+        // instead of the system silently picking a default handler.
+        settingRow(
+            "ⓘ", "229ED9",
+            L("درباره ما", "About us"),
+            L("کانال تلگرام برنامه", "The app's Telegram channel."),
+            null
+        ) {
+            try {
+                val view = Intent(Intent.ACTION_VIEW,
+                    android.net.Uri.parse("https://t.me/internet_azad_2026"))
+                startActivity(Intent.createChooser(view,
+                    L("باز کردن با تلگرام", "Open with Telegram")))
+            } catch (_: Exception) {}
+        }
+        // 1.75: the persistent download box lives BELOW the
+        // «بررسی بروزرسانی» row — it is filled in by
+        // refreshUpdateDownloadBox() (from the stored pending
+        // record) and stays there until the new version is
+        // installed. The slot itself is created here so the box
+        // keeps its place even when empty (GONE).
+        downloadBoxSlot = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
         // 1.73 (worker C): «بررسی بروزرسانی» — the LAST option in
         // Settings. Tapping it checks GitHub in the background:
         // latest -> «برنامه شما اخرین ورژن هست» for exactly 4s;
@@ -346,7 +679,23 @@ setBackgroundColor(Theme.divider(this@HomeSettingsActivity))
             L("نسخه جدید را از گیت‌هاب بررسی کن.", "Check GitHub for a new version."),
             null
         ) {
-            try { UpdateUi.showManualCheck(this) } catch (_: Exception) {}
+            // 1.75: the callback refreshes the persistent box
+            // below this row when the dialog's download starts
+            // or finishes — the download outlives the dialog.
+            try {
+                UpdateUi.showManualCheck(this) {
+                    try {
+                        refreshUpdateDownloadBox()
+                    } catch (_: Exception) {
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        // 1.75: the box slot sits directly under the check row.
+        downloadBoxSlot?.let { root.addView(it) }
+        try {
+            refreshUpdateDownloadBox()
+        } catch (_: Exception) {
         }
         setContentView(scroll)
         scroll.fitsSystemWindows = true

@@ -64,8 +64,12 @@ import java.util.concurrent.CountDownLatch
  *  text (same as CloudflareActivity's country rows); a country with
  *  no flag shows its name alone, never a wrong flag.
  *
- *  Opening the panel starts a test at once; the refresh icon re-runs
- *  it. The runner logic is the 1.72 home speed-test box's, moved verbatim in
+ *  1.75 (F): MAP FIRST, THEN TEST — opening the panel loads the map
+ *  first (geo lookup, then map tiles) and starts the test ONLY once
+ *  the map has finished loading, or definitively failed and the
+ *  placeholder is shown; the refresh icon re-runs the same sequence
+ *  (see SpeedTestSequencePure, the gate the panel drives). The runner
+ *  logic is the 1.72 home speed-test box's, moved verbatim in
  *  behaviour: generation guard, Canceller, and a per-run
  *  NetworkCallback that cancels the test the moment the default
  *  network changes (VPN on/off, network switch, IP change).
@@ -221,6 +225,15 @@ object SpeedTestPanel {
         private var mapZoom: Int = SpeedTestPanelPure.MAP_ZOOM_DEFAULT
         private var mapGen = 0
         private var mapShownKey: String? = null
+        // 1.75 (F): MAP FIRST, THEN TEST — the sequencing gate
+        // (SpeedTestSequencePure.Sequence, driven on the main
+        // thread) + the run the gate is holding the test for.
+        // pendingGen/pendingCanc are set in startTest and cleared
+        // when the test starts, finishes or is cancelled, so a
+        // stale map settle can never start a dead run's test.
+        private val sequence = SpeedTestSequencePure.Sequence()
+        private var pendingGen = -1
+        private var pendingCanc: SpeedTest.Canceller? = null
         /** Tile cache: stitched bitmaps per zoom (max 2, RGB_565),
          *  so zooming back to a visited level is instant instead
          *  of a re-fetch. Keyed by zoom only — cleared whenever
@@ -654,17 +667,25 @@ object SpeedTestPanel {
             } catch (_: Exception) {}
         }
 
-        /** Start a speed test + a parallel own-IP/geo fetch.
+        /** Start a run: MAP FIRST, THEN TEST (1.75, F). The geo
+         *  lookup runs first; when it lands, the map loads (or the
+         *  placeholder stays when there is no map); ONLY once the
+         *  map has finished loading — or definitively failed — does
+         *  the speed measurement start, via maybeStartSpeedTest.
          *  Runner logic moved from the 1.72 home speed-test box (v1.16/v1.17):
          *  same generation guard, same Canceller, same
          *  network-change cancel — the measurement itself is
-         *  SpeedTest.run, untouched. */
+         *  SpeedTest.run, untouched (it lives in
+         *  startSpeedMeasurement now, reached only through the gate). */
         fun startTest() {
             if (testing) return
             testing = true
             val g = ++gen
             val canc = SpeedTest.Canceller()
             canceller = canc
+            pendingGen = g
+            pendingCanc = canc
+            sequence.openPanel()
             netSig = try { activeNetworkSignature() } catch (_: Exception) { null }
             registerNetCallback()
             setDownload(null); setUpload(null); setPing(null)
@@ -678,13 +699,57 @@ object SpeedTestPanel {
             try { mapView.clearTiles() } catch (_: Exception) {}
             displayedStitched = null
             try { refreshView.alpha = 0.5f } catch (_: Exception) {}
-            // Own IP + geo, in parallel with the speed test.
+            // Step 1 — geo lookup ONLY. The speed test does NOT
+            // start here anymore: geoArrived is told first (so a
+            // cached map settling inside setGeo cannot open the gate
+            // early), then setGeo loads the map, then
+            // maybeStartSpeedTest starts the measurement iff the
+            // gate is open (no map to wait for).
             Thread {
                 try {
                     val geo = fetchOwnGeo()
-                    handler.post { if (g == gen) setGeo(geo) }
+                    handler.post {
+                        if (g == gen) {
+                            val hasMap = geo?.lat != null && geo?.lon != null
+                            sequence.geoArrived(hasMap)
+                            setGeo(geo)
+                            maybeStartSpeedTest()
+                        }
+                    }
                 } catch (_: Exception) {}
             }.apply { isDaemon = true }.start()
+        }
+
+        /** Start the measurement iff the sequencing gate is open
+         *  (geo done AND map settled or skipped) and it has not
+         *  started yet for this run. The only caller that starts
+         *  a measurement. */
+        private fun maybeStartSpeedTest() {
+            val g = pendingGen
+            val canc = pendingCanc ?: return
+            if (g < 0 || g != gen) return
+            if (!sequence.tryStartTest()) return
+            startSpeedMeasurement(g, canc)
+        }
+
+        /** One map load has settled — tiles shown (loaded=true)
+         *  or the placeholder left in place (loaded=false, the
+         *  load definitively failed). Opens the sequencing gate:
+         *  if this run is still waiting on the map, the speed test
+         *  may start now. A settle from a zoom/pan after the test
+         *  already started, or from a cancelled run, is a no-op
+         *  (the gate only opens once, from MAP_LOADING). */
+        private fun onMapSettled(loaded: Boolean) {
+            if (loaded) sequence.mapLoaded() else sequence.mapFailed()
+            maybeStartSpeedTest()
+        }
+
+        /** The speed measurement itself (download/upload/ping via
+         *  SpeedTest.run, untouched): reached ONLY through
+         *  maybeStartSpeedTest, i.e. only after the map has
+         *  settled. Same generation guard / Canceller / completion
+         *  handling as the 1.72 home box. */
+        private fun startSpeedMeasurement(g: Int, canc: SpeedTest.Canceller) {
             Thread {
                 val cb = object : SpeedTest.Callback {
                     override fun onPing(ms: Long) {
@@ -703,7 +768,10 @@ object SpeedTestPanel {
                 handler.post {
                     if (g != gen) return@post
                     testing = false
+                    sequence.finishTest()
                     if (canceller === canc) canceller = null
+                    pendingGen = -1
+                    pendingCanc = null
                     netSig = null
                     unregisterNetCallback()
                     try { refreshView.alpha = 1f } catch (_: Exception) {}
@@ -727,6 +795,11 @@ object SpeedTestPanel {
                 canceller?.cancel()
                 canceller = null
                 gen++
+                // 1.75 (F): close the gate — a map settle landing
+                // after the cancel must not start a test.
+                sequence.cancel()
+                pendingGen = -1
+                pendingCanc = null
                 testing = false
                 netSig = null
                 unregisterNetCallback()
@@ -798,7 +871,10 @@ object SpeedTestPanel {
          *  broken image, never fake streets). A cached zoom is
          *  shown at once, no re-fetch. Only the latest load (mapGen)
          *  may display, so a slow zoom-out can never overwrite a
-         *  newer zoom-in. */
+         *  newer zoom-in. Every load settles exactly once through
+         *  onMapSettled (1.75, F) — tiles shown, or the placeholder
+         *  on any failure — so the speed test waiting on the gate
+         *  always starts. */
         private fun loadMapAt(lat: Double, lon: Double, zoom: Int, panX: Double, panY: Double) {
             val key = "$lat|$lon|$zoom|$panX|$panY"
             if (key == mapShownKey) return
@@ -810,11 +886,17 @@ object SpeedTestPanel {
                     mapView.showTiles(cached.stitched, cached.plan, zoom, cached.fetchPanX, cached.fetchPanY)
                     refreshZoomButtons()
                 } catch (_: Exception) {}
+                // 1.75 (F): cached tiles count as loaded — the map
+                // is on screen, so the test may start.
+                onMapSettled(true)
                 return
             }
             val zoomPlan = SpeedTestPanelPure.planZoomableTiles(
                 lat, lon, zoom, mapWpx, mapHpx, panX, panY) ?: run {
                 try { mapView.onTilesFailed() } catch (_: Exception) {}
+                // 1.75 (F): no usable plan — the map definitively
+                // failed (placeholder stays), so the test may start.
+                onMapSettled(false)
                 return
             }
             val plan = zoomPlan.plan
@@ -857,6 +939,7 @@ object SpeedTestPanel {
                         handler.post {
                             if (mg != mapGen) return@post
                             try { mapView.onTilesFailed() } catch (_: Exception) {}
+                            onMapSettled(false)
                         }
                         return@Thread
                     }
@@ -890,12 +973,14 @@ object SpeedTestPanel {
                             mapView.showTiles(stitched, plan, zoom, panX, panY)
                             refreshZoomButtons()
                         } catch (_: Exception) {}
+                        onMapSettled(true)
                     }
                 } catch (_: Exception) {
                     // Tiles failed: the placeholder stays.
                     handler.post {
                         if (mg != mapGen) return@post
                         try { mapView.onTilesFailed() } catch (_: Exception) {}
+                        onMapSettled(false)
                     }
                 }
             }.apply { isDaemon = true }.start()
@@ -958,7 +1043,8 @@ object SpeedTestPanel {
     /** Open the floating speed-test page over Home. The Dialog's
      *  window is transparent with a 60% dim, centred, side margins
      *  ~24dp; tapping the dimmed area (or ×) dismisses it and
-     *  returns to the home page. Opening starts a test at once. */
+     *  returns to the home page. Opening loads the map first, then starts
+ *  the test once the map has settled (1.75, F). */
     fun show(activity: Activity) {
         val d = activity.resources.displayMetrics.density
         fun dp(v: Int) = (v * d + 0.5f).toInt()

@@ -10,15 +10,21 @@ import android.widget.*
 /**
  * Version history (2.22): opened by tapping the
  * version label on Home. Shows the LATEST version's
- * changes first; a glass button opens a version
+ * info first; a glass button opens a version
  * picker (a beautiful bottom sheet listing the
  * versions), and picking one closes the sheet and
- * shows ONLY that version's changes, numbered.
+ * shows ONLY that version's info, numbered.
  *
- * Only the CURRENT version is kept (1.74, user
+ * Only the CURRENT version is kept (1.75, user
  * order): previous versions' info was deleted.
  * When a new version is added, replace this
  * entry — do not re-add old ones.
+ *
+ * 1.75 (worker C): the screen shows the user's own
+ * feature list (VersionHistoryPure.FEATURE_TEXT_FA,
+ * verbatim) INSTEAD of per-version changelog entries —
+ * the old 1.74 changelog entries were deleted. The
+ * version number is still shown.
  */
 class VersionHistoryActivity : Activity() {
 
@@ -35,21 +41,16 @@ class VersionHistoryActivity : Activity() {
 
     // UPDATE WITH EVERY BUILD — keep ONLY the current version's entry.
     // با هر بیلد به‌روز کن — فقط همین یک ورژن بماند؛ ورژن قبلی را حذف کن.
-    // 1.74 (user order): previous versions' info deleted; history holds
-    // this version only.
+    // 1.75 (worker C): the entry's CONTENT is the user's own feature
+    // list (VersionHistoryPure, verbatim) — NOT a per-version
+    // changelog. The old 1.74 changelog entries were deleted.
+    // changesFa AND changesEn are the same verbatim Persian list:
+    // no English translation is invented.
     private val VERSIONS = listOf(
-        VersionEntry("1.74", 75,
-            "نقشه تست سرعت زوم‌دار و کامل شد، آیکن تست سرعت کیلومترشمار شد و آخرین اتصال وارپ رایگان را تشخیص می‌دهد",
-            listOf(
-                "نقشه تست سرعت حالا زوم‌دار است: با دو انگشت یا دکمه‌های + و − می‌توانی از ۱۱ تا ۱۶ زوم کنی و نقشه را بکشی؛ سنجاق روی همان مکان می‌ماند و نقشه کامل است",
-                "آیکن «تست سرعت» در صفحه اصلی و بالای پنل تست سرعت به کیلومترشمار (گیج سرعت) تغییر کرد؛ آیکن مانیتورینگ در نوار پایینی و ویجت همان قبلی است",
-                "«آخرین اتصال» حالا اتصال وارپ رایگان را هم تشخیص می‌دهد: بعد از وصل شدن وارپ رایگان، کارت آخرین اتصال آن را نشان می‌دهد و با زدن آن دوباره به همان وارپ وصل می‌شوی"
-            ),
-            listOf(
-                "The speed-test map is now zoomable and complete: pinch or use the + and − buttons to zoom from 11 to 16 and drag the map; the pin stays on the same location and the map is complete",
-                "The «Speed test» icon on the home page and at the top of the speed-test panel is now a speedometer (gauge); the monitoring icon in the bottom bar and the widget is unchanged",
-                "«Last connection» now recognises a Free WARP connection too: after connecting Free WARP, the last-connection card shows it and tapping it reconnects to the same WARP"
-            )),
+        VersionEntry(VersionHistoryPure.VERSION, VersionHistoryPure.CODE,
+            VersionHistoryPure.HEADER_FA,
+            VersionHistoryPure.FEATURE_LINES_FA,
+            VersionHistoryPure.FEATURE_LINES_FA),
     )
     private lateinit var contentBox: LinearLayout
     private lateinit var pickerBtn: Button

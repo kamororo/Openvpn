@@ -19,19 +19,29 @@ import java.io.File
  *  to them like any other section — no colours are hardcoded here
  *  beyond the shared theme.
  *
- *  1. HOME BOX (auto-check, once per launch): a glass card between
+ *  1. HOME BOX (auto-check, 1.75: on EVERY entry — cold start
+ *     AND every return to the foreground, via
+ *     autoCheckOnEntry called from HomeActivity.onResume; the
+ *     1.73 once-per-launch latch is gone): a glass card between
  *     the quick-connect card and the tile grid saying «ورژن جدید
  *     منتشر شده و قابل دریافت است», with [دانلود] [بعدا] below.
  *     [دانلود] swaps the buttons for a progress bar IN THE SAME
  *     BOX; when the download finishes the box shows the file —
- *     tap it to install. [بعدا] dismisses for this session (the
- *     check runs again on the next launch). A failed auto-check
- *     shows nothing at all (silent).
+ *     tap it to install. [بعدا] dismisses for this session FOR
+ *     THAT RELEASE ONLY (a newer release still shows its box).
+ *     A failed auto-check shows nothing at all (silent), and a
+ *     check already running is never stacked — the entry just
+ *     does nothing until the running fetch posts.
  *  2. MANUAL CHECK (Settings > «بررسی بروزرسانی», the LAST option):
  *     a compact dialog. Latest -> «برنامه شما اخرین ورژن هست» for
  *     exactly 4 seconds, then gone. Update -> the new version +
  *     [دانلود]; when the download finishes the dialog shows the
  *     file with [نصب]. A failed check shows a brief error only.
+ *     1.75: a download started here ALSO lives on as a
+ *     persistent box BELOW the «بررسی بروزرسانی» row in Settings
+ *     (HomeSettingsActivity) — same download, same file — so the
+ *     user can close this dialog, leave Settings, come back, and
+ *     still find the progress / the [نصب] button waiting.
  *
  *  RTL: every programmatic TextView sets textDirection LOCALE +
  *  gravity START, and every button row sets its layoutDirection
@@ -84,6 +94,14 @@ object UpdateUi {
      *  the system "allow from this source" setting with an
      *  explanation first — the user comes back and taps again. */
     private fun tapInstall(activity: Activity, file: File) {
+        installDownloaded(activity, file)
+    }
+
+    /** 1.75: the same tap-to-install, public so the Settings
+     *  download box (HomeSettingsActivity) can offer [نصب] for
+     *  the same downloaded file without duplicating the
+     *  permission flow. */
+    fun installDownloaded(activity: Activity, file: File) {
         when (UpdateChecker.installApk(activity, file)) {
             UpdateChecker.InstallResult.STARTED -> {
             }
@@ -111,28 +129,48 @@ object UpdateUi {
 
     // ---------- 1. the home box (auto-check) ----------
 
-    /** Once-per-launch auto-check into the home slot. Silent when
-     *  there is nothing to show (latest / error / dismissed). A
-     *  release found earlier in this launch is shown again without
-     *  a new network call (Home recreates on a night/day flip). */
-    fun autoCheckOnLaunch(activity: Activity, slot: LinearLayout) {
+    /** 1.75 (worker A): the auto-check on EVERY entry — cold
+     *  start AND every return to the foreground. HomeActivity
+     *  calls this from onResume (onCreate is always followed by
+     *  onResume, so the cold start is covered too; onResume is
+     *  also where a foreground return lands, which onCreate
+     *  never sees). Silent when there is nothing to show
+     *  (latest / error / dismissed-this-release).
+     *
+     *  Order matters:
+     *   1. A release found earlier in this launch, not dismissed,
+     *      is shown again without a new network call (Home
+     *      recreates on a night/day flip) — and when the box is
+     *      ALREADY on screen for that release (a download may be
+     *      in progress) it is never rebuilt.
+     *   2. No pending release, OR the pending one was dismissed
+     *      with [بعدا]: fetch FRESH — a release NEWER than the
+     *      dismissed one still shows its box. A fetch already
+     *      running is never stacked (tryBeginAutoCheck).
+     *   3. Latest / Error / same-dismissed-tag: silent, no box,
+     *      no nagging — and nothing is latched, so the NEXT entry
+     *      checks again (the 1.73 bug: a check that ran before
+     *      the release existed, or failed offline, latched
+     *      "done" for the whole process and the box never
+     *      appeared on re-entry). */
+    fun autoCheckOnEntry(activity: Activity, slot: LinearLayout) {
         try {
             val pending = UpdateChecker.lastKnownUpdate
-            if (pending != null && !UpdateChecker.dismissedThisSession) {
+            if (pending != null && !UpdateChecker.isDismissed(pending.tag)) {
+                if (slot.childCount > 0 && slot.visibility == View.VISIBLE) return
                 showHomeBox(activity, slot, pending)
                 return
             }
-            if (!UpdateChecker.shouldAutoCheck()) return
-            UpdateChecker.markAutoCheckDone()
+            if (!UpdateChecker.tryBeginAutoCheck()) return
             UpdateChecker.checkLatest(activity) { result ->
                 try {
                     if (activity.isFinishing || activity.isDestroyed) return@checkLatest
                     if (result is UpdateChecker.CheckResult.Update &&
-                        !UpdateChecker.dismissedThisSession
+                        !UpdateChecker.isDismissed(result.release.tag)
                     ) {
                         showHomeBox(activity, slot, result.release)
                     }
-                    // Latest / Error: silent, no box, no nagging.
+                    // Latest / Error / dismissed same tag: silent.
                 } catch (_: Exception) {
                 }
             }
@@ -276,10 +314,11 @@ object UpdateUi {
                         }
                     } catch (_: Exception) {
                     }
-                })
+                },
+                origin = "home")
         }
         laterBtn.setOnClickListener {
-            UpdateChecker.markDismissedThisSession()
+            UpdateChecker.markDismissedThisSession(release.tag)
             slot.visibility = View.GONE
             slot.removeAllViews()
         }
@@ -296,8 +335,15 @@ object UpdateUi {
     // ---------- 2. the manual check (Settings) ----------
 
     /** Settings > «بررسی بروزرسانی»: a compact dialog with the same
-     *  flow as the home box, plus the timed "latest" message. */
-    fun showManualCheck(activity: Activity) {
+     *  flow as the home box, plus the timed "latest" message.
+     *
+     *  1.75: [onDownloadStateChanged] is called when a download
+     *  STARTS and when it FINISHES (or fails), so Settings can
+     *  refresh the persistent download box below the
+     *  «بررسی بروزرسانی» row — the download itself keeps running
+     *  in the background when the dialog is closed, and the box
+     *  is what the user comes back to. */
+    fun showManualCheck(activity: Activity, onDownloadStateChanged: (() -> Unit)? = null) {
         val ctx = activity
         val dialog = Dialog(ctx)
         val content = LinearLayout(ctx).apply {
@@ -446,6 +492,13 @@ object UpdateUi {
             progressRow.visibility = View.VISIBLE
             bar.isIndeterminate = true
             percentText.text = ""
+            // 1.75: tell Settings the download started, so the
+            // persistent box below the option appears at once
+            // (the download outlives this dialog).
+            try {
+                onDownloadStateChanged?.invoke()
+            } catch (_: Exception) {
+            }
             UpdateChecker.downloadApk(ctx, rel,
                 onProgress = { _, _, percent ->
                     try {
@@ -462,6 +515,14 @@ object UpdateUi {
                     }
                 },
                 onDone = { file ->
+                    // 1.75: the pending record is already READY /
+                    // FAILED by now — tell Settings so its box
+                    // flips to [نصب] (or the retry) even if this
+                    // dialog was closed mid-download.
+                    try {
+                        onDownloadStateChanged?.invoke()
+                    } catch (_: Exception) {
+                    }
                     try {
                         if (!dialog.isShowing) return@downloadApk
                         if (file != null) {
@@ -482,7 +543,8 @@ object UpdateUi {
                         }
                     } catch (_: Exception) {
                     }
-                })
+                },
+                origin = "settings")
         }
         fileRow.setOnClickListener {
             val f = downloadedFile ?: return@setOnClickListener

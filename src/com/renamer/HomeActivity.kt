@@ -340,11 +340,12 @@ class HomeActivity : Activity() {
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         outer.addView(bottomBar)
         setContentView(outer)
-        // 1.73 (worker C): the update auto-check — once per launch,
-        // background, silent when there is nothing to show. When a
-        // newer release exists the box appears in updateBoxSlot
-        // (above the tiles) with [دانلود] [بعدا].
-        try { UpdateUi.autoCheckOnLaunch(this, updateBoxSlot) } catch (_: Exception) {}
+        // 1.75 (worker A): the update auto-check is NOT called
+        // here any more — it runs from onResume below, on EVERY
+        // entry (cold start, since onCreate is always followed by
+        // onResume, AND every return to the foreground, which
+        // onCreate never sees). Calling it here as well would
+        // stack a second fetch behind onResume's.
     }
 
     // reorder saved on the sort page is visible at
@@ -375,6 +376,18 @@ class HomeActivity : Activity() {
         try { refreshTileBorders() } catch (_: Exception) {}
         quickHandler.removeCallbacks(quickPoller)
         quickHandler.post(quickPoller)
+        // 1.75 (worker A): the update auto-check on EVERY entry —
+        // cold start (onCreate is always followed by onResume) AND
+        // every return to the foreground. The 1.73 once-per-launch
+        // latch meant a check that ran before a release existed
+        // (or failed offline, silently) never ran again until the
+        // process died, so the box never appeared on re-entry.
+        // Silent when there is nothing to show (latest / error /
+        // dismissed-this-release); when a newer release exists the
+        // box appears in updateBoxSlot with [دانلود] [بعدا].
+        // (After a recreate() above, this new instance's onResume
+        // runs the check — the early return is safe.)
+        try { UpdateUi.autoCheckOnEntry(this, updateBoxSlot) } catch (_: Exception) {}
     }
 
     override fun onPause() {

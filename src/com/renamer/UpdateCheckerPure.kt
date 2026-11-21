@@ -123,6 +123,39 @@ object UpdateCheckerPure {
     fun isUpdateAvailable(currentVersionName: String, latestTag: String): Boolean =
         compareVersions(latestTag, currentVersionName) == 1
 
+    /** 1.75 (worker A): the "show the home update box?" decision,
+     *  in one place so it is JVM-testable (TestMain175A):
+     *  show ONLY when there IS a parsed release (an error /
+     *  unparsable answer is null -> silent), the release HAS an
+     *  .apk to download, its tag is strictly newer than the
+     *  installed versionName ("v" prefix or not — "v1.75" beats
+     *  installed "1.74", installed "1.75" vs "v1.75" is latest),
+     *  and it is NOT the release the user dismissed with [بعدا]
+     *  this session (a NEWER release than the dismissed one
+     *  still shows). Latest / error / no-apk / malformed /
+     *  dismissed-same-tag are all silent. */
+    fun shouldShowUpdateBox(
+        currentVersionName: String,
+        release: ReleaseInfo?,
+        dismissedTag: String?
+    ): Boolean {
+        val rel = release ?: return false
+        if (!rel.hasApk) return false
+        if (!isUpdateAvailable(currentVersionName, rel.tag)) return false
+        if (isDismissedTag(dismissedTag, rel.tag)) return false
+        return true
+    }
+
+    /** True when [tag] is the release the user dismissed with
+     *  [بعدا] this session. Compared by VERSION, not by string,
+     *  so "v1.74" and "1.74" are the same dismissal. A null /
+     *  blank dismissal dismisses nothing. */
+    fun isDismissedTag(dismissedTag: String?, tag: String): Boolean {
+        val d = dismissedTag?.trim().orEmpty()
+        if (d.isBlank()) return false
+        return compareVersions(tag, d) == 0
+    }
+
     // ---------- download progress ----------
 
     /** Bytes -> percent (0..100). -1 when the total is unknown

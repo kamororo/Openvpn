@@ -2712,24 +2712,66 @@ class CloudflareActivity : Activity() {
             try {
                 when (val r = CfDeployClient.health(email, key)) {
                     is CfDeployClient.Result.Ok -> {
+                        // 1.76B: NEVER load an empty snapshot over
+                        // the live working set (the 1.76B bug: this
+                        // built an empty account — results [] +
+                        // bg_done false — and loadAccountToWorkingSet
+                        // then overwrote the page's v2ray configs +
+                        // green tick, permanently). Capture the
+                        // working set FIRST, before any pref
+                        // overwrite; the decision of what the new
+                        // account keeps is CloudflarePagePure's.
+                        val workingSnapshot = snapshotOfWorkingSet()
+                        val before = CloudflarePagePure.PageState(
+                            configs = results.toList(),
+                            bgDone = prefs().getBoolean("cf_bg_done", false),
+                            proxyLink = proxyLink(),
+                            proxyWorker = proxyWorker()
+                        )
                         prefs().edit()
                             .putString("cf_email", email)
                             .putString("cf_key", key)
                             .putBoolean("cf_step1_done", true)
                             .apply()
-                        val acc = JSONObject()
-                            .put("email", email)
-                            .put("key", key)
-                            .put("panel_url", "")
-                            .put("panel_user", "")
-                            .put("clean_ips", JSONArray().toString())
-                            .put("results", JSONArray().toString())
-                            .put("step1_done", true)
-                            .put("bg_done", false)
-                            .put("step2_done", false)
-                            .put("proxy_link", "")
-                            .put("proxy_worker", "")
                         val list = loadAccounts()
+                        val acc: JSONObject
+                        if (CloudflarePagePure.newAccountKeepsWorkingSet(
+                                workingSnapshot.optString("email", ""), email)) {
+                            // Same account the working set already
+                            // belongs to (the user re-enters the
+                            // email/key they built v2ray with): the
+                            // new snapshot IS the working set —
+                            // configs + green tick + panel state
+                            // carried over verbatim.
+                            acc = workingSnapshot
+                                .put("email", email)
+                                .put("key", key)
+                                .put("step1_done", true)
+                        } else {
+                            // A genuinely different account: record
+                            // the live working set as its own
+                            // account first, so its configs + tick
+                            // are not lost when the page switches
+                            // to the new (empty) account.
+                            if (CloudflarePagePure.workingSetHasState(
+                                    before,
+                                    workingSnapshot.optString("email", ""),
+                                    workingSnapshot.optString("panel_url", ""))) {
+                                list.add(workingSnapshot)
+                            }
+                            acc = JSONObject()
+                                .put("email", email)
+                                .put("key", key)
+                                .put("panel_url", "")
+                                .put("panel_user", "")
+                                .put("clean_ips", JSONArray().toString())
+                                .put("results", JSONArray().toString())
+                                .put("step1_done", true)
+                                .put("bg_done", false)
+                                .put("step2_done", false)
+                                .put("proxy_link", "")
+                                .put("proxy_worker", "")
+                        }
                         list.add(acc)
                         saveAccounts(list)
                         val idx = list.size - 1
@@ -2954,6 +2996,20 @@ class CloudflareActivity : Activity() {
 
     private fun renderResults() {
         renderProxyBox()
+        // 1.76B: the proxy box stays ABOVE the v2ray box —
+        // enforce the order on every render (onCreate adds
+        // them in this order; the decision is
+        // CloudflarePagePure.boxOrder: [PROXY, V2RAY] whenever
+        // both exist). No reorder path may invert it.
+        val boxParent = proxyResultsCard.parent as? android.view.ViewGroup
+        if (boxParent != null) {
+            val proxyIdx = boxParent.indexOfChild(proxyResultsCard)
+            val resultsIdx = boxParent.indexOfChild(resultsCard)
+            if (proxyIdx >= 0 && resultsIdx >= 0 && proxyIdx > resultsIdx) {
+                boxParent.removeView(proxyResultsCard)
+                boxParent.addView(proxyResultsCard, resultsIdx)
+            }
+        }
         resultsBox.removeAllViews()
         pingViews.clear()
         connectBtns.clear()

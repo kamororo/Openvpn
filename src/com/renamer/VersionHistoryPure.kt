@@ -19,8 +19,8 @@ package com.renamer
  *  76) is still shown by the activity, as before. */
 object VersionHistoryPure {
 
-    const val VERSION = "1.75"
-    const val CODE = 76
+    const val VERSION = "1.76"
+    const val CODE = 77
 
     const val HEADER_FA = "ویژگی های نسخه جدید :"
 

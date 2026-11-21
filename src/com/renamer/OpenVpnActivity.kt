@@ -3388,8 +3388,8 @@ class OpenVpnActivity : Activity() {
         }.start()
     }
 
-    /** LIVE "is any tunnel up" check — the engine's volatile
-     *  flags plus a foreign VPN. v1.24: a bare TRANSPORT_VPN
+    /** LIVE "is any tunnel up" check — the app's own live
+     *  tunnel state plus a foreign VPN. v1.24: a bare TRANSPORT_VPN
      *  bit is NOT trusted — the user's phone reports it on
      *  plain mobile/Wi-Fi with no VPN up (phantom VPN), so
      *  a foreign VPN counts as up ONLY when the active
@@ -3397,6 +3397,20 @@ class OpenVpnActivity : Activity() {
      *  show a real tunnel interface (tun/ppp/tap) with a
      *  link address. A VPN bit on a wlan/rmnet interface is
      *  ignored; missing link properties fail OPEN (not up).
+     *  1.76: the app's own live state counts FIRST, via
+     *  VpnGatePure — the same three flags QuickConnect.isLive()
+     *  reads (VpnClientService.isRunning || WgDirect.isLive ||
+     *  OvpnEngine.isConnected) plus OvpnEngine.isConnecting.
+     *  Before 1.76 this read ONLY the engine flags plus the
+     *  foreign observation, so a live free-WARP session read
+     *  as "no VPN" (WG rung: backend-only tunnel named after
+     *  the tunnel, never tun/ppp/tap; MASQUE rungs: the app is
+     *  disallowed from its own VPN, so its own activeNetwork
+     *  observation never shows the VPN bit) and the account
+     *  button showed the "turn on your VPN" toast with warp
+     *  connected. No persisted record is consulted here — a
+     *  finished warp session with a leftover record still
+     *  blocks (VpnGatePure takes live inputs only).
      *  Used by the account-creation gate (the signup sites
      *  need a VPN), the backup-account jobs, the guide and
      *  the Open-tab health sweep — never by the country
@@ -3435,8 +3449,22 @@ class OpenVpnActivity : Activity() {
 
     private fun anyVpnUp(): Boolean {
         return try {
-            if (OvpnEngine.isConnected || OvpnEngine.isConnecting) return true
-            foreignVpnUp()
+            // 1.76: the app's own live flags first (same
+            // sources QuickConnect.isLive() reads, plus
+            // isConnecting which it omits); the foreign
+            // observation stays as the last branch, so
+            // another app's VPN still counts. The decision
+            // itself lives in VpnGatePure (pure, JVM-tested);
+            // this only gathers the live inputs. No record,
+            // activeId or last-connection pref is read here.
+            VpnGatePure.isVpnUp(
+                serviceRunning = try { VpnClientService.isRunning } catch (_: Exception) { false },
+                sessionTag = try { VpnClientService.sessionTag } catch (_: Exception) { null },
+                wgLive = try { WgDirect.isLive(this) } catch (_: Exception) { false },
+                ovpnConnected = OvpnEngine.isConnected,
+                ovpnConnecting = OvpnEngine.isConnecting,
+                foreignUp = foreignVpnUp()
+            )
         } catch (_: Exception) { false }
     }
 

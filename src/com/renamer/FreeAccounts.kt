@@ -218,6 +218,19 @@ object FreeAccounts {
     @Synchronized
     fun activeBytes(ctx: Context): Long = active(ctx)?.bytesUsed ?: 0L
 
+    /** 1.42: delete EVERY stored free account (the
+     *  box delete). This is the ONLY delete path: the
+     *  v1.1 "NEVER delete" rule governs the failover
+     *  lifecycle (exhausted accounts rest, they are
+     *  not deleted to make room) — an explicit user
+     *  delete of the whole free box removes the
+     *  accounts with it, exactly like the main app's
+     *  confirmDeleteTb clears its stored account. */
+    @Synchronized
+    fun clearAll(ctx: Context) {
+        try { save(ctx, emptyList()) } catch (_: Exception) {}
+    }
+
     /** True when the active account is at/past the
      *  usage warn level (1900 MB) inside its window. */
     @Synchronized

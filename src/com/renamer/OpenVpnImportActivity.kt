@@ -10,9 +10,11 @@ import android.view.Gravity
 import android.view.View
 import android.widget.*
 
-/** Imported Profile page, exactly like the second
- *  screenshot: dark navy header with a back arrow
- *  and "Imported Profile", then Profile Name
+/** Imported Profile page (v1.12 restyle, item 8): the
+ *  app's own theme — day pearl aurora / night #070912
+ *  aurora page background, glass-card fields, themed
+ *  buttons (no navy header, no orange button). Fields
+ *  and behaviour are unchanged: Profile Name
  *  (auto-filled, editable), Server Hostname
  *  (locked, from the .ovpn remote line), Username,
  *  a "Save password" checkbox, Password with an
@@ -34,22 +36,25 @@ class OpenVpnImportActivity : Activity() {
         // Header (dp, see below)
         val density0 = resources.displayMetrics.density
         fun dp0(v: Int): Int = (v * density0).toInt()
+        // v1.12: the navy header is gone — the page background
+        // (day pearl aurora / night #070912 aurora) runs under
+        // the title, like the rest of the app (item 8).
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Color.parseColor(OpenVpnActivity.NAVY))
+            setBackgroundColor(Color.TRANSPARENT)
             setPadding(dp0(24), dp0(20), dp0(24), dp0(20))
         }
         header.addView(TextView(this).apply {
             text = "←"; textSize = 26f
-            setTextColor(Color.WHITE)
+            setTextColor(OvpnTheme.fg(this@OpenVpnImportActivity))
             setPadding(0, 0, dp0(24), 0)
             setOnClickListener { finish() }
         })
         header.addView(TextView(this).apply {
             text = if (isEdit) L("ویرایش پروفایل", "Edit Profile") else L("پروفایل واردشده", "Imported Profile")
             textSize = 26f
-            setTextColor(Color.WHITE)
+            setTextColor(OvpnTheme.fg(this@OpenVpnImportActivity))
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         })
         root.addView(header)
@@ -67,7 +72,7 @@ class OpenVpnImportActivity : Activity() {
         fun label(text: String): TextView {
             return TextView(this).apply {
                 this.text = text; textSize = 15f
-                setTextColor(if (OvpnTheme.isDark(this@OpenVpnImportActivity)) Color.parseColor("#A5C8FF") else Color.parseColor(OpenVpnActivity.NAVY))
+                setTextColor(OvpnTheme.subFg(this@OpenVpnImportActivity))
                 setPadding(0, dp(28), 0, dp(6))
             }
         }
@@ -84,7 +89,8 @@ class OpenVpnImportActivity : Activity() {
                 setTextColor(OvpnTheme.fg(this@OpenVpnImportActivity))
                 isEnabled = enabled
                 minHeight = dp(56)
-                setPadding(0, dp(12), 0, dp(12))
+                background = OvpnTheme.glassCard(this@OpenVpnImportActivity, 12f)
+                setPadding(dp(14), dp(12), dp(14), dp(12))
             }
         }
         body.addView(label(L("نام پروفایل", "Profile Name")))
@@ -105,11 +111,11 @@ class OpenVpnImportActivity : Activity() {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {
                 userLabel.setTextColor(if (s.isNullOrBlank()) Color.parseColor("#999999")
-                    else Color.parseColor(OpenVpnActivity.NAVY))
+                    else OvpnTheme.accent(this@OpenVpnImportActivity))
             }
             override fun afterTextChanged(s: android.text.Editable?) {}
         })
-        if (profile.username.isNotBlank()) userLabel.setTextColor(Color.parseColor(OpenVpnActivity.NAVY))
+        if (profile.username.isNotBlank()) userLabel.setTextColor(OvpnTheme.accent(this@OpenVpnImportActivity))
         body.addView(userLabel)
         body.addView(userField)
         body.addView(spacer())
@@ -118,7 +124,7 @@ class OpenVpnImportActivity : Activity() {
             text = L("ذخیره‌ی رمز", "Save password")
             isChecked = profile.savePassword
             textSize = 18f
-            setTextColor(if (OvpnTheme.isDark(this@OpenVpnImportActivity)) Color.parseColor("#A5C8FF") else Color.parseColor(OpenVpnActivity.NAVY))
+            setTextColor(OvpnTheme.subFg(this@OpenVpnImportActivity))
             setPadding(0, dp(24), 0, dp(12))
         }
         body.addView(saveBox)
@@ -128,12 +134,15 @@ class OpenVpnImportActivity : Activity() {
         val passRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            background = OvpnTheme.glassCard(this@OpenVpnImportActivity, 12f)
+            setPadding(dp(14), dp(2), dp(14), dp(2))
         }
         val passField = EditText(this).apply {
             setText(profile.password)
             textSize = 19f
             setTextColor(OvpnTheme.fg(this@OpenVpnImportActivity))
             minHeight = dp(56)
+            setBackgroundColor(Color.TRANSPARENT)
             setPadding(0, dp(12), 0, dp(12))
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             transformationMethod = PasswordTransformationMethod.getInstance()
@@ -143,11 +152,11 @@ class OpenVpnImportActivity : Activity() {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {
                 passLabel.setTextColor(if (s.isNullOrBlank()) Color.parseColor("#999999")
-                    else Color.parseColor(OpenVpnActivity.NAVY))
+                    else OvpnTheme.accent(this@OpenVpnImportActivity))
             }
             override fun afterTextChanged(s: android.text.Editable?) {}
         })
-        if (profile.password.isNotBlank()) passLabel.setTextColor(Color.parseColor(OpenVpnActivity.NAVY))
+        if (profile.password.isNotBlank()) passLabel.setTextColor(OvpnTheme.accent(this@OpenVpnImportActivity))
         passRow.addView(passField)
         var showPass = false
         passRow.addView(TextView(this).apply {
@@ -171,8 +180,8 @@ class OpenVpnImportActivity : Activity() {
         body.addView(passRow)
         body.addView(spacer())
 
-        // Bottom buttons: PROFILES (gray text) and
-        // CONNECT (orange), like the screenshot.
+        // Bottom buttons: PROFILES (glass) and CONNECT
+        // (themed teal→violet gradient).
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -180,8 +189,8 @@ class OpenVpnImportActivity : Activity() {
         }
         bottom.addView(Button(this).apply {
             text = L("پروفایل‌ها", "PROFILES"); textSize = 17f
-            setTextColor(Color.parseColor("#999999"))
-            setBackgroundColor(Color.TRANSPARENT)
+            setTextColor(OvpnTheme.fg(this@OpenVpnImportActivity))
+            background = OvpnTheme.glassCard(this@OpenVpnImportActivity, 12f)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             setOnClickListener {
                 saveAndFinish(nameField.text.toString(), userField.text.toString(),
@@ -191,11 +200,7 @@ class OpenVpnImportActivity : Activity() {
         bottom.addView(Button(this).apply {
             text = L("اتصال", "CONNECT"); textSize = 17f
             setTextColor(Color.WHITE)
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                cornerRadius = 12f
-                setColor(Color.parseColor(OpenVpnActivity.ORANGE))
-            }
+            background = OvpnTheme.tabBackground(this@OpenVpnImportActivity, true)
             setPadding(48, 24, 48, 24)
             setOnClickListener {
                 saveAndFinish(nameField.text.toString(), userField.text.toString(),

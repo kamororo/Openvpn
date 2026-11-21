@@ -21,7 +21,7 @@ import net.openvpn.ovpn3.ClientAPI_Config
  * for an Intent extra.
  *
  * v1.33 crash hardening (user reported
- * "calculator keeps stopping" on v1.32):
+ * "app keeps stopping" on v1.32):
  * - NO startForeground() at all. A VpnService
  *   is not a plain started service; calling
  *   startForeground on it was the same class
@@ -54,6 +54,21 @@ class Ovpn3VpnService : VpnService() {
         // profile). Owned by the service, closed on
         // stop and on the next connect.
         @Volatile var tbRelay: TunnelBearRelay? = null
+
+        /** v1.12 (ported from the Diag 1.1 crash fix, item 3):
+         *  wait for the previous core's connect thread to exit,
+         *  bounded. c.connect() blocks inside the native core
+         *  and the core retries internally, so a failed rung's
+         *  thread stays alive long after isConnecting=false;
+         *  starting a new core over a live one lets the dying
+         *  core's late events reset the new rung's state.
+         *  Returns true when the old thread is gone. */
+        fun awaitClientExit(timeoutMs: Long): Boolean {
+            val t = connectThread ?: return true
+            if (!t.isAlive) return true
+            try { t.join(timeoutMs) } catch (_: Throwable) {}
+            return !t.isAlive
+        }
     }
 
     private var tunFd: ParcelFileDescriptor? = null
@@ -99,6 +114,28 @@ class Ovpn3VpnService : VpnService() {
 
     private fun startClient(profile: OvpnProfile) {
         try { client?.stop() } catch (t: Throwable) {}
+        // v1.12: never start a second native core over a live
+        // one (item 3; ported from Diag 1.1). If the previous
+        // connect thread is still exiting, wait boundedly for
+        // it; if it still has not exited, SKIP this connect
+        // (log + lastError) instead of overlapping cores.
+        // The ladder's settle step normally makes this guard
+        // a no-op; it is the backstop.
+        try {
+            val prev = connectThread
+            if (prev != null && prev.isAlive) {
+                try { prev.join(5_000) } catch (_: Throwable) {}
+                if (prev.isAlive) {
+                    try {
+                        OvpnEngine.addLog("ovpn3: previous core still running, connect skipped (no second core)")
+                        OvpnEngine.lastError = AppLanguage.t(this, "وصل نشد: هسته‌ی قبلی هنوز در حال خاموش شدن است", "Failed to connect: previous core still stopping")
+                        OvpnEngine.isConnecting = false
+                        OvpnEngine.isConnected = false
+                    } catch (_: Throwable) {}
+                    return
+                }
+            }
+        } catch (_: Throwable) {}
         // 3.01: a previous session's relay never
         // lingers into the next connect.
         try { tbRelay?.close() } catch (t: Throwable) {}
@@ -223,7 +260,7 @@ class Ovpn3VpnService : VpnService() {
                         common.setTunPersist(true)
                         common.setRetryOnAuthFailed(false)
                         common.setClockTickMS(1000)
-                        common.setGuiVersion("Openvpn 1.0")
+                        common.setGuiVersion("InternetAzad2026 1.27")
                     } finally {
                         try { common.delete() } catch (_: Throwable) {}
                     }
@@ -245,7 +282,7 @@ class Ovpn3VpnService : VpnService() {
                 // 3.01: a TunnelBear profile's credentials
                 // come from the saved TunnelBear account,
                 // not from the profile itself — fill them
-                // here so every caller (page, widget,
+                // here so every caller (page,
                 // quick-connect) connects with the account.
                 // In-memory only; nothing is persisted.
                 if (TunnelBear.isTunnelBear(profile) &&
@@ -315,7 +352,7 @@ class Ovpn3VpnService : VpnService() {
         try {
             closeTun()
             val b = Builder()
-            b.setSession("Openvpn")
+            b.setSession("InternetAzad2026")
             try { b.setMtu(spec.mtu) } catch (t: Throwable) {}
             for ((addr, prefix) in spec.addresses) {
                 try { b.addAddress(addr, prefix) } catch (t: Throwable) {}

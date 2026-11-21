@@ -17,6 +17,7 @@ import android.os.Looper
 import android.provider.OpenableColumns
 import android.text.InputType
 import android.graphics.RenderEffect
+import android.graphics.RectF
 import android.graphics.Shader
 import android.os.Build
 import android.view.Gravity
@@ -26,29 +27,44 @@ import android.view.animation.LinearInterpolator
 import android.widget.*
 
 /**
- * Standalone Openvpn app v1.5 — the OpenVPN section of Config
- * Renamer, alone. Opens DIRECTLY into this page: no calculator
- * disguise, no lock, no PIN. Design = approved mockup v4, as
- * revised by the v1.1 order and the v1.2 fixes: channel-logo
- * header + ☰ at the top-LEFT opening a LEFT side drawer (log,
- * guide, day/night, language fa/en/ru, about), two tabs (Free
- * open vpn / Open vpn), one round glass connect orb (14s ring +
- * 40s dashed ring + glow). v1.5 changes ONLY the country-chip
- * name leak: the old upgrade adoption saved the raw entry name
- * "TunnelBear" as the picked country, so the chip showed it;
- * now adoption saves only real 47-list countries, a stored
- * non-country value is healed away on launch, and every
- * country display goes through the known-country guard. NO status pill under the orb, NO
+ * Standalone Openvpn app v1.8 — the OpenVPN section of Config
+ * Renamer, alone. Opens DIRECTLY into this page: no
+ * disguise, no lock, no PIN. Design = the main app's
+ * Profiles page (1.41, approved mockup): «Profiles»
+ * header with the app-log and "?" guide at the top
+ * (1.29: the ☰ drawer is gone; theme, language and
+ * About live in Settings), a DISCONNECTED / CONNECTED /
+ * CONNECTING status label, the free-account top box
+ * (same sapphire as the v2ray free box; its guide
+ * third leaves once the account exists), then the
+ * profile cards — each with a connect toggle, a pin,
+ * «OpenVPN Profile» + name, and info /
+ * edit / delete circles — and a teal→violet + FAB
+ * above the nav bar. v1.6 adds the «راهنمای اتصال»
+ * coach-marks tutorial (until the first free
+ * connection), the VPN gate, and accurate
+ * probe-only dots sorted by two-green then probe-handshake
+ * speed (low data: no downloads). v1.7: drawn-pointer overlay
+ * (no square, no ring), step-2 box in an attached window
+ * above the waiting dialog (failed on the phone — the
+ * dialog's dim still faded it), stage-based account-creation
+ * progress (real percentage + remaining time), no «بعدی»
+ * button, faster creation (5 s inbox poll, 60 s provider
+ * window, 10 s request timeout, staggered dual providers),
+ * dots legend while the tutorial is active. v1.8: the tutorial SPOTLIGHTS
+ * the target (dim veil with a hole exactly around it — no
+ * drawn pointer at all), the step-2 box is a second dialog
+ * above the waiting dialog's dim for real, the percentage
+ * is monotonic (never backwards) with seconds-left derived
+ * from it, the percentage sits on a dark pill, and creation
+ * is faster again (2 s inbox poll, 30 s provider window,
+ * providers ordered by measured speed). NO status pill under the orb, NO
  * «TunnelBear» anywhere user-visible (log included), NO on-page
- * connect-error text (log only). Free tab: the orb IS the free
+ * connect-error text (log only). The top box IS the free
  * flow — one tap creates TWO accounts in the background (first
  * ready connects, second is the backup, with auto-failover +
- * ~1900 MB usage failover); the country chip reads «انتخاب کشور»
- * until a country is picked, then shows its FLAG + NAME, and
- * opens a NARROW anchored popup. Open tab: smaller orb (162dp,
- * 29dp top gap), fixed above a scrolling list; tap a card to
- * SELECT it (light green), then the orb connects it; + FAB is
- * teal→violet and sits above the nav bar. NO Smart engine, NO
+ * ~1900 MB usage failover). Tap a card to SELECT it (light
+ * green); its toggle connects it. NO Smart engine, NO
  * chain, NO v2ray/WG — every connect here is one DIRECT ovpn3
  * connect (plus the internal split relay for the free entry,
  * exactly as the main app).
@@ -57,28 +73,72 @@ class OpenVpnActivity : Activity() {
     companion object {
         const val NAVY = "#1B365D"
         const val ORANGE = "#ED7D31"
+        // 1.71 (item 3): the last-CONNECTED free location
+        // — the country of the free tunnel that actually
+        // reached CONNECTED, in "renamer_ovpn" prefs.
+        // The widget's connect target resolves to this,
+        // never to the last-picked-but-never-connected
+        // country. Public so the widget provider can
+        // read the same key.
+        const val LAST_FREE_COUNTRY_KEY = "tb_last_free_country"
+        // v1.22: the crash catcher is installed once per
+        // process (onCreate can run again on recreate —
+        // re-installing would nest handlers and log the
+        // same crash twice).
+        @Volatile private var crashCatcherInstalled = false
+        @Volatile var engineChainName: String? = null
+        val proxyOwnerLock = Any()
+        @Volatile var proxyOwner: String? = null
+        fun releaseChainProxyOwner() {
+            synchronized(proxyOwnerLock) {
+                if (proxyOwner == "chain") proxyOwner = null
+            }
+        }
     }
 
     // ---------- state ----------
     private var profiles: MutableList<OvpnProfile> = mutableListOf()
-    private var tab = "free"
     private var selectedProfile: String? = null
 
     // Free-account box state (3.03-3.06, main app).
     @Volatile private var tbCreating = false
-    private var tbCountryMenuOpen = false
     // v1.1 dual accounts: one failover attempt per user
     // tap (connect failure), and one usage-failover
     // backup spawn per session while no backup exists.
     private var freeFailoverTried = false
+    // 1.71 (item 3): the country the current free connect
+    // attempt is for (captured in connectProfile, recorded
+    // as the last-connected free country only when the
+    // tunnel reaches CONNECTED — a pick made DURING the
+    // connect must not move the record).
+    private var connectingFreeCountry: String? = null
+    // 1.71 (item 3): the widget auto-connect fires once
+    // per activity instance (onCreate and onNewIntent
+    // both route through handleWidgetAutoConnect).
+    private var widgetAutoConnectDone = false
     private var backupSpawnedForUsage = false
-    private val tbCountryRowCircles = HashMap<String, LinearLayout>()
-    private val tbCountryHosts = HashMap<String, String>()
-    private var tbCountryProbeGen = 0
-    private var tbCountryProbePool: java.util.concurrent.ExecutorService? = null
+    private var exitIpCheckAtMs = 0L
+    // v1.12: detailed connection log (item 2) — the attempt
+    // start (ms) and the rung currently running; the log
+    // lines name the method, the rung, the duration and the
+    // last core state, so a problem can be followed up from
+    // the log alone.
+    private var connectAttemptStartMs = 0L
+    @Volatile private var currentRungFa: String? = null
+    @Volatile private var currentRungEn: String? = null
+    @Volatile private var currentRungRu: String? = null
+    // v1.12: whether the ladder started any rung in the
+    // current attempt (item 3) — the finally in
+    // connectDirect clears a connecting state only when
+    // no rung ever started.
+    private var ladderStartedAnyRung = false
+    // v1.12: list self-heal (item 4) — the signature of the
+    // last render mismatch logged, so it is logged once.
+    private var lastListMismatchSig: String? = null
     private var tbWaitDialog: android.app.AlertDialog? = null
     private var tbWaitDotsView: TextView? = null
     private var tbWaitProgressView: android.widget.ProgressBar? = null
+    private var tbWaitPctView: TextView? = null
     private var tbWaitCountdownView: TextView? = null
     private var tbWaitDots = 0
     private val tbWaitDotsLoop = object : Runnable {
@@ -88,18 +148,59 @@ class OpenVpnActivity : Activity() {
                 if (tbWaitDialog?.isShowing == true && v != null) {
                     tbWaitDots = (tbWaitDots % 3) + 1
                     v.text = L("لطفا کمی صبر کنید", "Please wait a moment") + ".".repeat(tbWaitDots)
-                    orbSmall?.text = ".".repeat(tbWaitDots)
                     handler.postDelayed(this, 1000)
                 }
             } catch (_: Exception) {}
         }
     }
 
-    // Health dots (2.23-2.24, 3.07): upper = TLS flight / direct
-    // test on this line, lower = session (AUTH + PUSH_REPLY).
+    // v1.10 retry ladder (imported profiles): a generation guard
+    // — a fresh tap or a user stop supersedes a running ladder —
+    // the live flag that suppresses the poller's per-rung failure
+    // line (the ladder logs exactly one failure line itself, only
+    // when every rung has failed), and the winning rung's name
+    // for the poller's success line.
+    private val retryGen = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var retryLadderRunning = false
+    @Volatile private var retryWonFa: String? = null
+    @Volatile private var retryWonEn: String? = null
+    @Volatile private var retryWonRu: String? = null
+
+    // v1.9: honest waiting screen — elapsed time + a way out.
+    // v1.10: the stage DESCRIPTION line is gone from the screen
+    // (user order) — the stage index still drives the
+    // elapsed/countdown line, and the stages still go to the app
+    // log. The creation job itself is owned by DualFree (not the
+    // Activity) so minimizing cannot stop it.
+    private var tbWaitCancelView: TextView? = null
+    private var tbWaitStageIdx = -1
+    private var tbWaitStartMs = 0L
+    private val tbWaitElapsedLoop = object : Runnable {
+        override fun run() {
+            try {
+                // During the unpredictable mail wait the
+                // screen shows the stage + the elapsed
+                // seconds — never a frozen fake countdown.
+                if (tbWaitDialog?.isShowing == true && tbWaitStageIdx == 4) {
+                    val el = ((System.currentTimeMillis() - tbWaitStartMs) / 1000).toInt()
+                    tbWaitCountdownView?.text = T("$el ثانیه گذشته", "$el s elapsed", "прошло $el с")
+                    handler.postDelayed(this, 1000)
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun startElapsedLoop() {
+        try { handler.removeCallbacks(tbWaitElapsedLoop) } catch (_: Exception) {}
+        try { handler.post(tbWaitElapsedLoop) } catch (_: Exception) {}
+    }
+
+    // 1.42 (G): the card health dots are GONE (user
+    // order) — pins replace them (see renderCards).
+    // The session-probe sweep still runs: its cache
+    // feeds Monitoring's session-proven count, not
+    // any card. localHealth is the sweep's memory.
     private val localHealth = HashMap<String, Int>()
-    private val localDotViews = HashMap<String, View>()
-    private val remoteDotViews = HashMap<String, View>()
     private var healthSweepGen = 0
     private var lastVpnBusy = false
 
@@ -141,41 +242,77 @@ class OpenVpnActivity : Activity() {
             // v1.1: usage-based failover while the free
             // tunnel is up (checked every poll).
             try { maybeUsageFailover() } catch (_: Exception) {}
+            // v1.6: advance/retreat the «راهنمای اتصال»
+            // tutorial from the real state (creating ->
+            // account ready -> country picked -> connected).
+            try { checkGuideState() } catch (_: Exception) {}
+            // v1.7: the first free-tunnel connection ends
+            // the tutorial for good, even if the guide
+            // was never opened.
+            // v1.13: NOT during a throughput-sweep measurement
+            // (a measurement is not the user connecting).
+            try { if (freeConnected()) noteFirstFreeConnection() } catch (_: Exception) {}
+            // v1.13: when the exit IP changes to an unseen
+            // one, retry the pending second-account job on
+            // its own (throttled to once per 5 min).
+            try { maybeExitChangeBackupRetry() } catch (_: Exception) {}
             handler.postDelayed(this, 2000)
         }
     }
 
     // ---------- view refs (built once, updated in place) ----------
+    // 1.41 (E): the page is the main app's Profiles look —
+    // header, status label, top box, profile
+    // cards, + FAB. The tabs, orb, country chip/popup,
+    // floating guide button is GONE with the
+    // old Free/Open split. 1.42: pins are BACK on the
+    // cards (user order, overriding the 1.41 dots).
     private lateinit var rootFrame: FrameLayout
-    private var tabFreeBtn: TextView? = null
-    private var tabOpenBtn: TextView? = null
-    private var glowView: View? = null
-    private var ringArcView: View? = null
-    private var ringDashedView: View? = null
-    private var orbView: FrameLayout? = null
-    private var orbIcon: TextView? = null
-    private var orbBig: TextView? = null
-    private var orbSmall: TextView? = null
-    private var orbPct: TextView? = null
-    private var countryChip: TextView? = null
-    private var statusLine: TextView? = null
-    private var openSection: LinearLayout? = null
-    // v1.1: left drawer + about overlay + layout refs.
-    private var pageView: LinearLayout? = null
-    private var zoneView: FrameLayout? = null
-    private var freeBelow: LinearLayout? = null
-    private var openScroll: ScrollView? = null
-    private var drawerScrim: View? = null
-    private var drawerPanel: LinearLayout? = null
-    private var drawerWidthPx = 0
-    private var drawerOpen = false
-    private var aboutOverlay: FrameLayout? = null
-    private var countryPopup: android.widget.PopupWindow? = null
+    private var statusLabel: TextView? = null
+    private var topBoxView: LinearLayout? = null
+    private var topBoxMain: LinearLayout? = null
+    private var topBoxTitle: TextView? = null
+    private var topBoxGuidePart: LinearLayout? = null
+    private var topBoxGuideDivider: View? = null
+    private var topBoxGuidePulseAnim: ValueAnimator? = null
+    // The top box's connect toggle in state B (the
+    // tutorial's step-4 target) — set when
+    // renderTopBox builds the state-B box.
+    private var tbToggleView: android.widget.ImageView? = null
+    // 1.42 (D): the state-B country menu opens INSIDE
+    // the top box (main app renderTbBox).
+    private var tbCountryMenuOpen = false
+    // 1.42: renderTopBox rebuilds the box only when
+    // its state signature changes (else the 2s
+    // poller would rebuild it — and reset an open
+    // country menu / the tutorial spotlight —
+    // every 2 seconds).
+    private var lastTopBoxSig: String? = null
     private var cardsContainer: LinearLayout? = null
-    private var emptyHint: TextView? = null
     private var fab: Button? = null
-    private var ringArcAnim: ObjectAnimator? = null
-    private var ringDashedAnim: ObjectAnimator? = null
+    // v1.6: «راهنمای اتصال» guided tutorial — coach
+    // marks over the real UI. 1.41: its entry points
+    // are the header "?" and the top box's guide
+    // third (the floating button is gone).
+    private var guideStep = 0
+    // 1.41: step 4's connect was really tried (set when
+    // the engine is connecting during step 4), so a
+    // stale lastError from an older attempt cannot end
+    // the guide before the user taps.
+    private var guideStep4Tried = false
+    private var guideOverlay: FrameLayout? = null
+    private var guideDimView: GuideOverlayView? = null
+    private var guideBox: LinearLayout? = null
+    private var guideBoxTitle: TextView? = null
+    private var guideBoxText: TextView? = null
+    // v1.7: no «بعدی» button anymore — the tutorial
+    // advances only by tapping the target or by real
+    // state changes. v1.8: step 2's box is a SECOND
+    // dialog shown after the waiting dialog (its own
+    // top-level window, dimAmount 0) — the v1.7
+    // attached window still sat under the waiting
+    // dialog's dim and came out faded on the phone.
+    private var guideStep2Dialog: android.app.Dialog? = null
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
     private fun dpF(v: Float): Int = (v * resources.displayMetrics.density).toInt()
@@ -195,10 +332,41 @@ class OpenVpnActivity : Activity() {
         ownProfiles().firstOrNull { it.name == selectedProfile }
 
     // ---------- lifecycle ----------
+    /** v1.22: crash catcher — the app sometimes closes
+     *  suddenly with no trace in the app log (there was
+     *  no uncaught-exception handler at all). This records
+     *  ONE entry in the app log (fa/en/ru, no provider
+     *  name — class names are redacted at write time)
+     *  with the exception name + message + first stack
+     *  lines, then chains to the previous default handler
+     *  so the crash behaves EXACTLY as before (same
+     *  dialog, same process death) — it only records, it
+     *  never swallows. The next sudden close is then
+     *  diagnosable from the log. */
+    private fun installCrashCatcher() {
+        if (crashCatcherInstalled) return
+        crashCatcherInstalled = true
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val stack = e.stackTrace.take(6).joinToString("\n") { "  at $it" }
+                val raw = "${e.javaClass.simpleName}: ${e.message ?: ""}\n$stack"
+                val clean = raw.replace("TunnelBear", "TB").take(800)
+                AppLog.append(applicationContext, "openvpn",
+                    "برنامه بسته شد (کرش): $clean",
+                    "App crashed: $clean",
+                    "Приложение закрылось (сбой): $clean")
+            } catch (_: Exception) {}
+            try {
+                prev?.uncaughtException(t, e)
+            } catch (_: Exception) {}
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        installCrashCatcher()
         OvpnTheme.applyPage(this)
-        tab = getSharedPreferences("renamer_ovpn", MODE_PRIVATE).getString("ovpn_tab", "free") ?: "free"
         selectedProfile = getSharedPreferences("renamer_ovpn", MODE_PRIVATE).getString("ovpn_last", null)
         // 3.02: the single free entry (one stored profile whose
         // country follows the pick). 3.01 users arrive with 47
@@ -212,6 +380,22 @@ class OpenVpnActivity : Activity() {
         profiles = OvpnStore.load(this)
         buildUi()
         refreshAll()
+        // 1.71 (item 3): a widget tap opens this activity
+        // with widget_auto_connect=true — connect to the
+        // last-connected free location.
+        handleWidgetAutoConnect()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        if (intent != null) setIntent(intent)
+        // 1.71 (item 3): a widget tap while this activity
+        // is already alive arrives here.
+        handleWidgetAutoConnect()
     }
 
     override fun onResume() {
@@ -221,21 +405,46 @@ class OpenVpnActivity : Activity() {
         // away (auto mode): rebuild if the effective mode changed.
         if (OvpnTheme.isDark(this) != lastDark) recreate()
         handler.post(poller)
-        startRingAnims()
+        // v1.12: instant orb sync (item 5) — the engine
+        // calls this at the end of every state event so
+        // the orb refreshes immediately, not only on the
+        // 2s poller.
+        OvpnEngine.stateListener = {
+            handler.post {
+                try {
+                    if (!isFinishing && !isDestroyed) refreshStatus()
+                } catch (_: Throwable) {}
+            }
+        }
         refreshAll()
         val toConnect = OvpnStore.pendingConnect
         if (toConnect != null) {
             OvpnStore.pendingConnect = null
-            if (!toConnect.tunnelBear) setTab("open")
             connectProfile(toConnect)
         }
         startHealthSweep()
+        // v1.10: a creation started by a previous (destroyed)
+        // instance may still be running — re-attach the waiting
+        // dialog to it (or handle its result if it finished while
+        // we were away).
+        try { maybeReattachCreation() } catch (_: Exception) {}
+        // v1.10: if the first account exists but the backup was
+        // never created, build it silently now — no screen — but
+        // only while a VPN is up; otherwise skip quietly and try
+        // a later open.
+        try { maybeCreateBackupOnOpen() } catch (_: Exception) {}
     }
 
     override fun onPause() {
         super.onPause()
         handler.removeCallbacks(poller)
-        stopRingAnims()
+        OvpnEngine.stateListener = null
+        // 1.41: stop the top box's guide pulse while away
+        // (renderTopBox restarts it if the guide third
+        // shows) and end the tutorial overlay.
+        try { topBoxGuidePulseAnim?.cancel() } catch (_: Exception) {}
+        topBoxGuidePulseAnim = null
+        endGuide()
         healthSweepGen++
     }
 
@@ -247,111 +456,123 @@ class OpenVpnActivity : Activity() {
         refreshList()
     }
 
-    private fun setTab(t: String) {
-        tab = t
-        try {
-            getSharedPreferences("renamer_ovpn", MODE_PRIVATE).edit().putString("ovpn_tab", t).apply()
-        } catch (_: Exception) {}
-        renderTabs()
-        renderOrb()
-        renderStatus()
-        renderExtrasVisibility()
-    }
 
-    private fun startRingAnims() {
-        try {
-            ringArcAnim?.cancel()
-            ringDashedAnim?.cancel()
-            ringArcAnim = ObjectAnimator.ofFloat(ringArcView, "rotation", 0f, 360f).apply {
-                duration = 14000
-                interpolator = LinearInterpolator()
-                repeatCount = ValueAnimator.INFINITE
-            }
-            ringDashedAnim = ObjectAnimator.ofFloat(ringDashedView, "rotation", 0f, -360f).apply {
-                duration = 40000
-                interpolator = LinearInterpolator()
-                repeatCount = ValueAnimator.INFINITE
-            }
-            ringArcAnim?.start()
-            ringDashedAnim?.start()
-        } catch (_: Exception) {}
-    }
 
-    private fun stopRingAnims() {
-        try { ringArcAnim?.cancel() } catch (_: Exception) {}
-        try { ringDashedAnim?.cancel() } catch (_: Exception) {}
-    }
-
-    // ---------- UI construction (mockup v4, v1.1 layout) ----------
-    // The header, tabs and orb are FIXED; only the Open
-    // tab's config list scrolls (openScroll, weight 1),
-    // so the orb is always visible. The free tab shows
-    // only the status line below the orb.
+    // ---------- UI construction (1.41: main-app Profiles look) ----------
+    // ONE scrolling page — header, status label, top
+    // box, profile cards — with the + FAB
+    // floating above the nav bar. The tabs, orb and
+    // the Open tab's own scroll are gone.
     private fun buildUi() {
         val dark = OvpnTheme.isDark(this)
         rootFrame = FrameLayout(this)
+        // 1.42 (E): the page background lives on the
+        // root AND the scroll too — in 1.41 only the
+        // short inner page had it, so the empty area
+        // below the content showed the white window
+        // background (two-tone page).
+        rootFrame.background = OvpnTheme.pageBackground(this)
+        // 1.41 (E): ONE scrolling page, exactly the main
+        // app's Profiles look — header, status label,
+        // top box, profile cards. The tabs,
+        // orb and the Open tab's own scroll are gone;
+        // the whole page scrolls as one. Bottom padding
+        // (96dp) clears the + FAB.
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = OvpnTheme.pageBackground(this@OpenVpnActivity)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT)
+            setPadding(0, 0, 0, dp(96))
+        }
+        buildHeader(page, dark)
+        // Status label ("DISCONNECTED" / "CONNECTED: …" /
+        // "CONNECTING: …"), main-app style, 20sp bold.
+        statusLabel = TextView(this).apply {
+            text = "DISCONNECTED"
+            textSize = 20f
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            setTextColor(Color.parseColor(if (dark) "#26A69A" else "#5B7A99"))
+            textDirection = View.TEXT_DIRECTION_LTR
+            gravity = Gravity.START
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(20), dp(16), dp(20), dp(8))
+            }
+        }
+        page.addView(statusLabel)
+        buildTopBox(page, dark)
+        cardsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT)
+        }
+        page.addView(cardsContainer)
+        // 1.43 (C): the empty-hint text is GONE — no
+        // «هنوز پروفایلی اضافه نشده است…» on this page.
+        val pageScroll = ScrollView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT)
+            isVerticalScrollBarEnabled = true
+            // 1.43 (A): fill the viewport — the short inner
+            // page stretches to the full screen height, so
+            // its background covers the empty area below
+            // the content too (no second colour below it).
+            // 1.44 (A): fillViewport STAYS (the uniform
+            // background needs it) — but it is also what
+            // blew the state-A box up to ~60% of the
+            // screen in 1.43. ROOT CAUSE, verified in
+            // code: with the page measured EXACTLY
+            // viewport-high, the box's WRAP_CONTENT
+            // height is measured AT_MOST the remaining
+            // viewport, and its plain 1dp divider View
+            // (MATCH_PARENT height, no content of its
+            // own) measures itself to that whole AT_MOST
+            // size — a content-less View takes the full
+            // spec size — so the box took the divider's
+            // height and the title sat vertically centred
+            // in it (the main part's CENTER gravity).
+            // In 1.42 the page was measured UNSPECIFIED,
+            // so the divider measured 0 and the box was
+            // 67dp. (The v2ray free box has the same
+            // divider pattern but its ScrollView has no
+            // fillViewport, so it never blew up.) The
+            // box now gets an EXACT height per state
+            // (setBoxHeight), which also caps the
+            // MATCH_PARENT children to that height.
+            isFillViewport = true
+            // 1.42 (E): same background as the page,
+            // so the whole screen is one uniform
+            // background even where there is no content.
+            background = OvpnTheme.pageBackground(this@OpenVpnActivity)
+            addView(page)
         }
-        pageView = page
-        buildHeader(page, dark)
-        buildTabs(page, dark)
-        // Hairline divider.
-        page.addView(View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
-                setMargins(dp(28), dp(18), dp(28), 0)
-            }
-            setBackgroundColor(Color.parseColor(if (dark) "#17FFFFFF" else "#E3EAF0"))
-        })
-        buildOrbZone(page, dark)
-        buildStatusLine(page, dark)
-        buildOpenSection(page, dark)
-        rootFrame.addView(page)
-        // + FAB (58dp), Open tab only — teal→violet like
-        // the active tab (v1.1: NOT gold), positioned
-        // ABOVE the nav bar via the insets listener.
+        rootFrame.addView(pageScroll)
+        // + FAB (72dp), always visible — EXACTLY the main
+        // app's (config-renamer OpenVpnActivity.kt:296-
+        // 313): a light glass circle with a gradient
+        // border, blue "+" in day, white at night.
+        // Positioned ABOVE the nav bar via the insets
+        // listener.
         fab = Button(this).apply {
             text = "+"
-            textSize = 30f
+            textSize = 32f
             setTypeface(null, android.graphics.Typeface.BOLD)
-            setTextColor(OvpnTheme.fabTextColor(this@OpenVpnActivity))
-            background = OvpnTheme.fabBackground(this@OpenVpnActivity)
-            layoutParams = FrameLayout.LayoutParams(dp(58), dp(58)).apply {
+            setTextColor(Color.parseColor(if (dark) "#FFFFFF" else "#8B7CF6"))
+            background = Theme.gradientGlowCircle(this@OpenVpnActivity,
+                if (dark) Theme.darken(Color.parseColor("#CC2A3048")) else Color.parseColor("#F2EEFB"), dark)
+            layoutParams = FrameLayout.LayoutParams(dp(72), dp(72)).apply {
                 gravity = Gravity.BOTTOM or Gravity.END
-                setMargins(dp(22), dp(22), dp(22), dp(22))
+                setMargins(dp(24), dp(24), dp(24), dp(24))
             }
             setPadding(0, 0, 0, 0)
             setOnClickListener { importFile() }
         }
         rootFrame.addView(fab)
-        buildDrawer()
-        // Swipe: left-to-right opens the drawer,
-        // right-to-left closes it (return false so the
-        // page keeps its own touch handling).
-        var downX = 0f
-        var downY = 0f
-        rootFrame.setOnTouchListener { _, ev ->
-            when (ev.actionMasked) {
-                android.view.MotionEvent.ACTION_DOWN -> {
-                    downX = ev.x; downY = ev.y
-                }
-                android.view.MotionEvent.ACTION_UP -> {
-                    val dx = ev.x - downX
-                    val dy = ev.y - downY
-                    if (kotlin.math.abs(dx) > dp(90) &&
-                        kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.5f) {
-                        if (dx > 0 && !drawerOpen) openDrawer()
-                        else if (dx < 0 && drawerOpen) closeDrawer()
-                    }
-                }
-            }
-            false
-        }
         setContentView(rootFrame)
         // Safe area: status-bar inset on top, nav-bar
         // inset under the FAB (never fitsSystemWindows,
@@ -360,32 +581,34 @@ class OpenVpnActivity : Activity() {
             try {
                 val top = insets.systemWindowInsetTop
                 val bottom = insets.systemWindowInsetBottom
-                page.setPadding(0, top, 0, 0)
+                page.setPadding(0, top, 0, dp(96))
                 (fab?.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                    lp.bottomMargin = dp(22) + bottom
+                    lp.bottomMargin = dp(24) + bottom
                     fab?.layoutParams = lp
                 }
-                // v1.2: the drawer panel is added straight
-                // to rootFrame (not inside `page`), so it
-                // never got the status-bar inset — its logo
-                // sat flush against the top edge and
-                // collided with the Dynamic Island. Give it
-                // the status-bar inset + 24dp.
-                drawerPanel?.setPadding(0, top + dp(24), 0, dp(16))
             } catch (_: Exception) {}
             insets
         }
-        renderExtrasVisibility()
+        renderTopBox()
     }
 
-    // v1.2 header: FORCED LTR row [☰] [logo] [Openvpn].
+    // v1.2 header: FORCED LTR row [Openvpn] [log].
     // The manifest has no supportsRtl, so the framework
-    // forces LTR layout everywhere — the v1.1 header
-    // relied on RTL (☰ added last) and the ☰ landed at
-    // the TOP-RIGHT on device. LTR + ☰ first puts it at
-    // the LEFT end in EVERY language, as ordered. The
-    // log / guide / day-night buttons live ONLY in the
-    // drawer.
+    // forces LTR layout everywhere. 1.29: the ☰ drawer is
+    // gone — Log (app log) sits at the top of the page,
+    // like the main app's OpenVPN section. 1.35: the
+    // header "?" is gone too — the floating guide
+    // button is the single guide entry.
+    // Theme, language and About live in Settings.
+    // 1.41 (E): «Profiles» header, exactly the main
+    // app's — 26sp bold title, a "?" circle and the
+    // log icon on the right (no ☰; the drawer is gone
+    // since 1.29). 1.43 (D): "?" opens the GENERAL
+    // OpenVPN guide dialog — exactly the main app's
+    // showOvpnGuide, NOT the account-creation tutorial
+    // (that lives in the top box's guide third).
+    // The log icon opens the log. Forced LTR (the
+    // manifest has no supportsRtl).
     private fun buildHeader(page: LinearLayout, dark: Boolean) {
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -393,614 +616,1144 @@ class OpenVpnActivity : Activity() {
             layoutDirection = View.LAYOUT_DIRECTION_LTR
             setPadding(dp(20), dp(14), dp(20), dp(8))
         }
-        // ☰ FIRST (leftmost): opens the drawer.
         header.addView(TextView(this).apply {
-            text = "☰"
-            textSize = 18f
+            text = "Profiles"
+            textSize = 26f
             setTypeface(null, android.graphics.Typeface.BOLD)
             setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
-            gravity = Gravity.CENTER
-            background = OvpnTheme.glassCircle(this@OpenVpnActivity)
-            layoutParams = LinearLayout.LayoutParams(dp(34), dp(34))
-            setPadding(0, 0, 0, 0)
-            setOnClickListener { openDrawer() }
-        })
-        // Channel logo: the trimmed circle (never the
-        // rectangular photo, never the old shield).
-        header.addView(ImageView(this).apply {
-            try {
-                val bmp = BitmapFactory.decodeStream(assets.open("logo_circle.png"))
-                setImageBitmap(bmp)
-            } catch (_: Exception) {
-                setImageBitmap(null)
-            }
-            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40)).apply {
-                marginStart = dp(10)
-            }
-            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
-            contentDescription = "Openvpn"
-        })
-        header.addView(TextView(this).apply {
-            text = "Openvpn"
-            textSize = 22f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
-            textDirection = appTextDir()
+            textDirection = View.TEXT_DIRECTION_LTR
             gravity = Gravity.START
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = dp(10)
-            }
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         })
-        page.addView(header)
-    }
-
-    private fun buildTabs(page: LinearLayout, dark: Boolean) {
-        val tabs = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutDirection = rtlDir()
-            setPadding(dp(20), dp(16), dp(20), 0)
-        }
-        fun makeTab(text: String, t: String): TextView {
-            return TextView(this).apply {
-                this.text = text
-                textSize = 15f
-                setTypeface(null, android.graphics.Typeface.BOLD)
-                gravity = Gravity.CENTER
-                setPadding(0, dp(11), 0, dp(11))
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    marginStart = if (t == "open") dp(10) else 0
-                }
-                setOnClickListener { setTab(t) }
-            }
-        }
-        tabFreeBtn = makeTab("Free open vpn", "free")
-        tabOpenBtn = makeTab("Open vpn", "open")
-        tabs.addView(tabFreeBtn)
-        tabs.addView(tabOpenBtn)
-        page.addView(tabs)
-        renderTabs()
-    }
-
-    private fun renderTabs() {
-        val dark = OvpnTheme.isDark(this)
-        tabFreeBtn?.background = OvpnTheme.tabBackground(this, tab == "free")
-        tabFreeBtn?.setTextColor(if (tab == "free") Color.WHITE else OvpnTheme.subFg(this))
-        tabOpenBtn?.background = OvpnTheme.tabBackground(this, tab == "open")
-        tabOpenBtn?.setTextColor(if (tab == "open") Color.WHITE else OvpnTheme.subFg(this))
-    }
-
-    private fun buildOrbZone(page: LinearLayout, dark: Boolean) {
-        // 340dp zone: the glow overflows the 264dp ring area,
-        // so the zone is sized for the glow, orb centred.
-        val zone = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(340), dp(340)).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-                topMargin = dp(58)
-            }
-        }
-        zoneView = zone
-        glowView = View(this).apply {
-            layoutParams = FrameLayout.LayoutParams(dp(340), dp(340)).apply {
-                gravity = Gravity.CENTER
-            }
-        }
-        zone.addView(glowView)
-        ringArcView = View(this).apply {
-            layoutParams = FrameLayout.LayoutParams(dp(258), dp(258)).apply {
-                gravity = Gravity.CENTER
-            }
-            background = OvpnTheme.ringArcDrawable(this@OpenVpnActivity)
-        }
-        zone.addView(ringArcView)
-        ringDashedView = View(this).apply {
-            layoutParams = FrameLayout.LayoutParams(dp(246), dp(246)).apply {
-                gravity = Gravity.CENTER
-            }
-            background = OvpnTheme.dashedRingDrawable(this@OpenVpnActivity)
-        }
-        zone.addView(ringDashedView)
-        orbView = FrameLayout(this).apply {
-            layoutParams = FrameLayout.LayoutParams(dp(232), dp(232)).apply {
-                gravity = Gravity.CENTER
-            }
-            setOnClickListener { onOrbTap() }
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT)
-            setPadding(dp(20), dp(20), dp(20), dp(20))
-        }
-        orbIcon = TextView(this).apply {
-            text = "🛡️"
-            textSize = 32f
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-        content.addView(orbIcon)
-        orbBig = TextView(this).apply {
-            textSize = 28f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
-            textDirection = appTextDir()
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-        content.addView(orbBig)
-        orbSmall = TextView(this).apply {
-            textSize = 12.5f
-            setTextColor(OvpnTheme.subFg(this@OpenVpnActivity))
-            textDirection = appTextDir()
-            gravity = Gravity.CENTER
-            maxLines = 2
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-        content.addView(orbSmall)
-        orbPct = TextView(this).apply {
-            textSize = 15f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setTextColor(OvpnTheme.accent(this@OpenVpnActivity))
-            gravity = Gravity.CENTER
-            visibility = View.GONE
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-        content.addView(orbPct)
-        // Country chip: BELOW «اتصال» inside the orb, never above.
-        countryChip = TextView(this).apply {
-            textSize = 12.5f
+        // "?" circle (28dp), like the main app's.
+        header.addView(TextView(this).apply {
+            text = "?"
+            textSize = 15.4f
             setTypeface(null, android.graphics.Typeface.BOLD)
             setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
             textDirection = View.TEXT_DIRECTION_LTR
             gravity = Gravity.CENTER
-            background = OvpnTheme.glassPill(this@OpenVpnActivity)
-            visibility = View.GONE
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(9)
+            background = OvpnTheme.glassCircle(this@OpenVpnActivity)
+            layoutParams = LinearLayout.LayoutParams(dp(28), dp(28)).apply {
+                marginEnd = dp(8)
             }
-            setPadding(dp(11), dp(6), dp(11), dp(6))
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            isClickable = true
-            setOnClickListener { toggleCountryPanel() }
-        }
-        content.addView(countryChip)
-        orbView?.addView(content)
-        zone.addView(orbView)
-        page.addView(zone)
+            // 1.43 (D): the general OpenVPN guide, like
+            // the main app's "?" — NOT the tutorial.
+            setOnClickListener { showOvpnGuide() }
+        })
+        // Log icon (28dp), at the right end.
+        header.addView(android.widget.ImageView(this).apply {
+            setImageBitmap(HydraUi.logIconBitmap(this@OpenVpnActivity, 28))
+            layoutParams = LinearLayout.LayoutParams(dp(28), dp(28))
+            setOnClickListener { showLogDialog() }
+        })
+        page.addView(header)
     }
 
-    // v1.1: NO status pill under the orb (removed).
-    // Only the status line, on the free tab — and it
-    // NEVER shows a connect error (log only).
-    private fun buildStatusLine(page: LinearLayout, dark: Boolean) {
-        freeBelow = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-        statusLine = TextView(this).apply {
-            textSize = 12.5f
-            setTextColor(OvpnTheme.subFg(this@OpenVpnActivity))
-            textDirection = appTextDir()
-            gravity = Gravity.CENTER
-            minHeight = dp(42)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(dp(30), dp(14), dp(30), 0)
-            }
-        }
-        freeBelow?.addView(statusLine)
-        page.addView(freeBelow)
-    }
-
-    // v1.1: the Open tab's list lives in its own
-    // ScrollView (weight 1) BELOW the fixed orb: a gap
-    // equal to the orb's top gap, a divider line, then
-    // the list. ONLY the list scrolls; the orb stays
-    // visible. Bottom padding clears the + FAB.
-    private fun buildOpenSection(page: LinearLayout, dark: Boolean) {
-        openSection = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT)
-            setPadding(0, 0, 0, dp(96))
-        }
-        // Gap equal to the orb's top gap (29dp).
-        openSection?.addView(View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(29))
-        })
-        // Divider, same style as the line under the tabs.
-        openSection?.addView(View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
-                setMargins(dp(28), 0, dp(28), 0)
-            }
-            setBackgroundColor(Color.parseColor(if (dark) "#17FFFFFF" else "#E3EAF0"))
-        })
-        openSection?.addView(TextView(this).apply {
-            text = L("پروفایل‌های من", "My profiles")
-            textSize = 13f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setTextColor(OvpnTheme.subFg(this@OpenVpnActivity))
-            textDirection = appTextDir()
-            gravity = Gravity.START
+    // 1.41 (E): the top box — the SAME texture and
+    // background as the v2ray free box (OvpnTheme.
+    // freeBoxBackground, 20dp radius, 1dp stroke),
+    // minHeight 84dp like the main app's state A.
+    // Before the account is created: title «ساخت
+    // اکانت openvpn رایگان» + subtitle «برای ساخت
+    // اکانت رایگان فیلترشکن خود را روشن کنید», and
+    // the right ~30% is the guide («راهنما», gently
+    // blinking) behind a 1dp divider. After the
+    // account is created the guide part is gone and
+    // the box text is UNCHANGED (approved mockup
+    // frame 4) — the main part then fills the whole
+    // box. Tapping the main part = onFreeEntryTap
+    // (the old orb tap); tapping the guide part =
+    // the interactive tutorial. While creating, the
+    // title reads «لطفا کمی صبر کنید» (main app
+    // state A) and the tap only toasts.
+    // 1.42 (B/C/D): the top box, main-app form
+    // (config-renamer OpenVpnActivity.kt renderTbBox
+    // ~line 803). State A (no account): a single-line
+    // title + the guide third, WRAP_CONTENT with
+    // minHeight 53dp — 1.71 item 5: the SAME height
+    // as the WireGuard free box (was 67dp; the 84dp
+    // of 1.41 is gone), and
+    // the subtitle («برای ساخت اکانت رایگان فیلترشکن
+    // خود را روشن کنید») is gone from the box: it
+    // lives in the Guide now (GuideDetailActivity,
+    // openvpn section). State B (account saved): the
+    // main app's box — minHeight 105dp, top row =
+    // toggle + «Free OpenVpn config» + DELETE only,
+    // picker row «Select country: … ▾», inline country
+    // menu inside the box when open. The box keeps
+    // the SAME sapphire texture as the v2ray box
+    // (OvpnTheme.freeBoxBackground); heights differ
+    // by content (53 / 105dp — state B stays 105dp:
+    // it is a TWO-row box, toggle + picker, and cannot
+    // fit 53dp). The box is rebuilt by
+    // renderTopBox() when its state signature changes.
+    private fun buildTopBox(page: LinearLayout, dark: Boolean) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = OvpnTheme.freeBoxBackground(this@OpenVpnActivity)
+            elevation = 2 * resources.displayMetrics.density
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(dp(24), dp(20), dp(24), 0)
-            }
-        })
-        cardsContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-        openSection?.addView(cardsContainer)
-        emptyHint = TextView(this).apply {
-            text = L("هنوز پروفایلی اضافه نشده است. با دکمه + یک فایل .ovpn وارد کن.",
-                "No profile yet. Tap the + button to import an .ovpn file.")
-            textSize = 14f
-            setTextColor(OvpnTheme.subFg(this@OpenVpnActivity))
-            textDirection = appTextDir()
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(dp(24), dp(16), dp(24), 0)
+                setMargins(dp(20), 0, dp(20), dp(14))
             }
         }
-        openSection?.addView(emptyHint)
-        openScroll = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
-            isVerticalScrollBarEnabled = true
-            addView(openSection)
-        }
-        page.addView(openScroll)
+        topBoxView = box
+        page.addView(box)
     }
 
-    private fun renderExtrasVisibility() {
-        val isFree = tab == "free"
-        freeBelow?.visibility = if (isFree) View.VISIBLE else View.GONE
-        openScroll?.visibility = if (isFree) View.GONE else View.VISIBLE
-        fab?.visibility = if (isFree) View.GONE else View.VISIBLE
-        if (!isFree) {
-            try { countryPopup?.dismiss() } catch (_: Exception) {}
-            countryPopup = null
-            tbCountryMenuOpen = false
-        }
-        applyOrbSize()
+    /** 1.44 (A): set the top box's height EXACTLY.
+     *  minimumHeight alone does NOT cap a box: it is a
+     *  floor, and a WRAP_CONTENT box still grows to its
+     *  tallest child — which, under fillViewport, was
+     *  the 1dp divider measuring itself to the whole
+     *  remaining viewport (see the fillViewport note
+     *  in buildUi). An EXACT layout height also makes
+     *  the MATCH_PARENT children (main, divider,
+     *  guide part) measure to exactly that height. */
+    private fun setBoxHeight(hPx: Int) {
+        val box = topBoxView ?: return
+        try {
+            val lp = box.layoutParams as? LinearLayout.LayoutParams ?: return
+            if (lp.height != hPx) {
+                lp.height = hPx
+                box.layoutParams = lp
+            }
+        } catch (_: Exception) {}
     }
 
-    // v1.1 orb sizes: free tab 232dp orb / 58dp top gap
-    // (as v1.0); open tab 30% smaller (162dp) with a
-    // 50% smaller top gap (29dp).
-    private fun applyOrbSize() {
-        val zone = zoneView ?: return
-        val isFree = tab == "free"
-        val zoneSize = if (isFree) 340 else 240
-        val topGap = if (isFree) 58 else 29
-        val orbSize = if (isFree) 232 else 162
-        val ringSize = if (isFree) 258 else 182
-        val dashSize = if (isFree) 246 else 174
-        (zone.layoutParams as? LinearLayout.LayoutParams)?.let {
-            it.width = dp(zoneSize)
-            it.height = dp(zoneSize)
-            it.topMargin = dp(topGap)
-            zone.layoutParams = it
-        }
-        (glowView?.layoutParams as? FrameLayout.LayoutParams)?.let {
-            it.width = dp(zoneSize); it.height = dp(zoneSize)
-            glowView?.layoutParams = it
-        }
-        (ringArcView?.layoutParams as? FrameLayout.LayoutParams)?.let {
-            it.width = dp(ringSize); it.height = dp(ringSize)
-            ringArcView?.layoutParams = it
-        }
-        (ringDashedView?.layoutParams as? FrameLayout.LayoutParams)?.let {
-            it.width = dp(dashSize); it.height = dp(dashSize)
-            ringDashedView?.layoutParams = it
-        }
-        (orbView?.layoutParams as? FrameLayout.LayoutParams)?.let {
-            it.width = dp(orbSize); it.height = dp(orbSize)
-            orbView?.layoutParams = it
-        }
-    }
-
-    // ---------- left side drawer (v1.1) ----------
-    // Slides in from the LEFT (Gravity.LEFT — the user
-    // explicitly said left, even though the app is RTL).
-    // Contents, top to bottom: channel logo (trimmed
-    // circle) first, then app log, guide, day/night,
-    // app language, about.
-    private fun buildDrawer() {
-        val root = rootFrame
-        drawerScrim = View(this).apply {
-            setBackgroundColor(Color.parseColor("#80000000"))
-            alpha = 0f
-            visibility = View.GONE
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT)
-            setOnClickListener { closeDrawer() }
-        }
-        root.addView(drawerScrim)
-        // v1.2: NARROWER drawer — ~60% of the screen
-        // width, max 300dp (v1.1's 280dp was ~72% and
-        // hid too much of the page). The hidden offset
-        // follows the width.
-        drawerWidthPx = minOf(dp(300),
-            (resources.displayMetrics.widthPixels * 0.6).toInt())
-        val panel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutDirection = rtlDir()
-            background = OvpnTheme.dialogCard(this@OpenVpnActivity)
-            layoutParams = FrameLayout.LayoutParams(drawerWidthPx,
-                FrameLayout.LayoutParams.MATCH_PARENT).apply {
-                gravity = Gravity.LEFT
+    /** 1.42: rebuilds the top box for the current state
+     *  (called from buildUi, refreshStatus and
+     *  refreshList). State A: title + guide third.
+     *  State B-no-entry: account saved but no stored
+     *  entry — the entry is restored first (main app
+     *  renderTbBox ~line 903); if it still has none,
+     *  a centred 53dp «Free OpenVpn config» label
+     *  whose tap restores the entry. State B: the
+     *  main-app box (105dp). */
+    private fun renderTopBox() {
+        val box = topBoxView ?: return
+        try {
+            val dark = OvpnTheme.isDark(this)
+            val d = resources.displayMetrics.density
+            // Account saved but no stored entry: bring
+            // the entry back so the toggle can connect
+            // (main app renderTbBox ~line 903). Only
+            // when an account is still saved — after a
+            // box delete the account is cleared too, so
+            // nothing is resurrected.
+            if (TunnelBear.hasAccount(this) && profiles.none { it.tunnelBear }) {
+                try {
+                    TunnelBear.ensureSingleEntry(this, restoreDeleted = true)
+                    profiles = OvpnStore.load(this)
+                } catch (_: Exception) {}
             }
-            // v1.2: top padding is corrected by the
-            // insets listener (status bar + 24dp) once
-            // it fires; 28dp is only the pre-insets
-            // fallback so the logo never sits flush
-            // against the top edge.
-            setPadding(0, dp(28), 0, dp(16))
-            translationX = -(drawerWidthPx + dp(20)).toFloat()
-        }
-        drawerPanel = panel
-        // Channel logo FIRST (circular, white trimmed).
-        panel.addView(ImageView(this).apply {
-            try {
-                val bmp = BitmapFactory.decodeStream(assets.open("logo_circle.png"))
-                setImageBitmap(bmp)
-            } catch (_: Exception) {
-                setImageBitmap(null)
+            val hasAccount = TunnelBear.hasAccount(this)
+            val p = tbProfile()
+            val connected = OvpnEngine.isConnected || OvpnEngine.isConnecting
+            val isActive = connected && p != null && OvpnEngine.activeName == p.name
+            val isBusy = OvpnEngine.isConnecting && p != null && OvpnEngine.activeName == p.name
+            val country = if (p != null) TunnelBear.selectedCountry(this) else ""
+            val sig = listOf(hasAccount, tbCreating, p?.hostname ?: "", country,
+                tbCountryMenuOpen, isActive, isBusy,
+                // 1.43 (G): a pin tap must rebuild the box
+                // (the open menu re-sorts pinned-first).
+                TunnelBear.pinnedCountries(this).sorted().joinToString(",")).joinToString("|")
+            if (sig == lastTopBoxSig) {
+                // Same state: only make sure the state-A
+                // guide pulse is running (onPause cancels
+                // it, and this early return would else
+                // leave the guide third unblinking).
+                if (!hasAccount && topBoxGuidePart != null && topBoxGuidePulseAnim == null) {
+                    val part = topBoxGuidePart ?: return
+                    topBoxGuidePulseAnim = ValueAnimator.ofFloat(1f, 0.6f, 1f).apply {
+                        duration = 2000
+                        repeatCount = ValueAnimator.INFINITE
+                        addUpdateListener { part.alpha = it.animatedValue as Float }
+                        start()
+                    }
+                }
+                return
             }
-            layoutParams = LinearLayout.LayoutParams(dp(72), dp(72)).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-                bottomMargin = dp(18)
+            lastTopBoxSig = sig
+            topBoxGuidePulseAnim?.cancel()
+            topBoxGuidePulseAnim = null
+            topBoxGuidePart = null
+            topBoxGuideDivider = null
+            tbToggleView = null
+            box.removeAllViews()
+            if (!hasAccount) {
+                // ---- State A: single-line title + guide. ----
+                box.orientation = LinearLayout.HORIZONTAL
+                box.layoutDirection = View.LAYOUT_DIRECTION_LTR
+                box.gravity = Gravity.CENTER_VERTICAL
+                box.isClickable = false
+                box.minimumHeight = dp(53)
+                // 1.44 (A) + 1.71 item 5: EXACT 53dp — the
+                // WireGuard free box's height (was 67dp).
+                // minimumHeight alone cannot cap the height
+                // (see setBoxHeight); the exact-height pin
+                // STAYS because this page's ScrollView has
+                // fillViewport (1.44 — a minHeight-only box
+                // blew up to ~60% of the screen in 1.43).
+                setBoxHeight(dp(53))
+                box.setPadding(0, 0, 0, 0)
+                val main = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER
+                    layoutParams = LinearLayout.LayoutParams(
+                        0, LinearLayout.LayoutParams.MATCH_PARENT, 70f)
+                    setPadding(dp(16), dp(10), dp(16), dp(10))
+                    isClickable = true
+                    setOnClickListener { onFreeEntryTap() }
+                }
+                topBoxMain = main
+                topBoxTitle = TextView(this).apply {
+                    text = if (tbCreating)
+                        L("لطفا کمی صبر کنید", "Please wait a moment")
+                    else
+                        // 1.43 (B): «اکانت openvpn رایگان»
+                        // (was «ساخت اکانت openvpn رایگان»),
+                        // 16.2sp (-10%), one line.
+                        L("اکانت openvpn رایگان", "Free OpenVpn account")
+                    textSize = 16.2f
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    setTypeface(null, android.graphics.Typeface.BOLD)
+                    setTextColor(OvpnTheme.orbText(this@OpenVpnActivity))
+                    textDirection = appTextDir()
+                    gravity = Gravity.CENTER
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT)
+                }
+                main.addView(topBoxTitle)
+                box.addView(main)
+                val divider = View(this).apply {
+                    setBackgroundColor(if (dark) Theme.darken(Color.parseColor("#33507A")) else Color.parseColor("#BFD9F5"))
+                    layoutParams = LinearLayout.LayoutParams(dp(1), LinearLayout.LayoutParams.MATCH_PARENT)
+                }
+                topBoxGuideDivider = divider
+                box.addView(divider)
+                val guidePart = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                        cornerRadii = floatArrayOf(
+                            0f, 0f, 20f * resources.displayMetrics.density,
+                            20f * resources.displayMetrics.density,
+                            20f * resources.displayMetrics.density,
+                            20f * resources.displayMetrics.density, 0f, 0f)
+                        setColor(if (dark) Theme.darken(Color.parseColor("#14FFFFFF")) else Color.parseColor("#26FFFFFF"))
+                    }
+                    layoutParams = LinearLayout.LayoutParams(
+                        0, LinearLayout.LayoutParams.MATCH_PARENT, 30f)
+                    isClickable = true
+                    setOnClickListener { startGuide() }
+                }
+                guidePart.addView(TextView(this).apply {
+                    text = T("راهنما", "Guide", "Руководство")
+                    // 1.43 (B): guide font -10% too.
+                    textSize = 12.6f
+                    setTypeface(null, android.graphics.Typeface.BOLD)
+                    setTextColor(OvpnTheme.orbText(this@OpenVpnActivity))
+                    textDirection = appTextDir()
+                    gravity = Gravity.CENTER
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT)
+                })
+                topBoxGuidePart = guidePart
+                box.addView(guidePart)
+                topBoxGuidePulseAnim = ValueAnimator.ofFloat(1f, 0.6f, 1f).apply {
+                    duration = 2000
+                    repeatCount = ValueAnimator.INFINITE
+                    addUpdateListener { guidePart.alpha = it.animatedValue as Float }
+                    start()
+                }
+                return
             }
-            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
-        })
-        fun row(icon: String, fa: String, en: String, onClick: () -> Unit) {
-            val r = LinearLayout(this).apply {
+            if (p == null) {
+                // ---- State B, no stored entry: 53dp label; tap restores. ----
+                box.orientation = LinearLayout.VERTICAL
+                box.gravity = Gravity.CENTER
+                box.minimumHeight = dp(53)
+                // 1.44 (A): EXACT 53dp here too (1.71 item 5).
+                setBoxHeight(dp(53))
+                box.setPadding(dp(16), dp(12), dp(16), dp(12))
+                topBoxMain = box
+                box.addView(TextView(this).apply {
+                    text = "Free OpenVpn config"
+                    // 1.43 (B): box title -10%.
+                    textSize = 16.2f
+                    setTypeface(null, android.graphics.Typeface.BOLD)
+                    setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
+                    textDirection = View.TEXT_DIRECTION_LTR
+                    gravity = Gravity.CENTER
+                })
+                box.isClickable = true
+                box.setOnClickListener {
+                    try {
+                        TunnelBear.ensureSingleEntry(this, restoreDeleted = true)
+                        profiles = OvpnStore.load(this)
+                    } catch (_: Exception) {}
+                    refreshList()
+                }
+                return
+            }
+            // ---- State B: account + entry (main app form). ----
+            box.orientation = LinearLayout.VERTICAL
+            box.gravity = Gravity.NO_GRAVITY
+            box.isClickable = false
+            box.minimumHeight = dp(105)
+            // 1.44 (A): EXACT 105dp while the menu is
+            // closed; WRAP_CONTENT while it is open so
+            // the box grows to fit the menu (mockup
+            // frame 3). 105dp is the menu-CLOSED height
+            // only.
+            // 1.44 (C): any stale box-body click
+            // listener on this same View object (the
+            // state-B-no-entry restore tap) is cleared
+            // here — in state B ONLY the left toggle
+            // connects. The state-A creation tap (the
+            // main part's own listener) is untouched.
+            box.setOnClickListener(null)
+            setBoxHeight(if (tbCountryMenuOpen)
+                LinearLayout.LayoutParams.WRAP_CONTENT else dp(105))
+            box.setPadding(dp(16), dp(12), dp(16), dp(12))
+            topBoxMain = box
+            val topRow = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                layoutDirection = rtlDir()
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT)
-                setPadding(dp(20), dp(13), dp(20), dp(13))
-                isClickable = true
-                setOnClickListener { onClick() }
             }
-            r.addView(TextView(this).apply {
-                text = icon
-                textSize = 18f
-                gravity = Gravity.CENTER
+            val boxToggle = android.widget.ImageView(this).apply {
+                setImageBitmap(if (isBusy) HydraUi.toggleBitmapBusy(this@OpenVpnActivity)
+                    else if (dark) Theme.pillToggleBitmap(this@OpenVpnActivity, (62 * 0.7f).toInt(), (41 * 0.7f).toInt(), isActive,
+                        "#8B9098", "#9AA0B0", "#1B746C", "#B2DFDB")
+                    else Theme.pillToggleBitmap(this@OpenVpnActivity, (62 * 0.7f).toInt(), (41 * 0.7f).toInt(), isActive,
+                        "#FFF3D6", "#FFFFFF", "#C8E6C9", "#81C784"))
+                layoutParams = LinearLayout.LayoutParams((48 * 0.7f * d).toInt(), (32 * 0.7f * d).toInt()).apply {
+                    setMargins(0, 0, (8 * 0.7f * d).toInt(), 0)
+                }
+                setOnClickListener { onFreeEntryTap() }
+            }
+            tbToggleView = boxToggle
+            topRow.addView(boxToggle)
+            val labelCol = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                setPadding((24 * d).toInt(), 0, (12 * d).toInt(), 0)
+            }
+            labelCol.addView(TextView(this).apply {
+                text = "Free OpenVpn config"
+                // 1.43 (B): box title -10%.
+                textSize = 16.2f
                 setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
-                layoutParams = LinearLayout.LayoutParams(dp(34), LinearLayout.LayoutParams.WRAP_CONTENT)
+                if (isActive) setTypeface(null, android.graphics.Typeface.BOLD)
+                textDirection = View.TEXT_DIRECTION_LTR
+                gravity = Gravity.START
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
             })
-            r.addView(TextView(this).apply {
-                text = L(fa, en)
-                textSize = 15.5f
+            topRow.addView(labelCol)
+            // Delete only (no edit, no info): the main
+            // app's pink trash circle.
+            val trashPad = (8 * 0.7f * d).toInt()
+            topRow.addView(android.widget.ImageView(this).apply {
+                setImageBitmap(Theme.trashGlyphBitmap(this@OpenVpnActivity,
+                    if (dark) "#F48FB1" else "#D32F2F", (20 * 0.7f).toInt()))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                    setColor(if (dark) Theme.darken(Color.parseColor("#33FCE4EC")) else Color.parseColor("#FCE4EC"))
+                    setStroke((1 * d).toInt(), Color.parseColor(if (dark) "#F48FB1" else "#F8BBD0"))
+                }
+                val s = (36 * 0.7f * d).toInt()
+                layoutParams = LinearLayout.LayoutParams(s, s).apply {
+                    marginStart = (6 * 0.7f * d).toInt()
+                }
+                setPadding(trashPad, trashPad, trashPad, trashPad)
+                setOnClickListener { confirmDeleteTb(p) }
+            })
+            box.addView(topRow)
+            // Picker row (no «Country: …» line — main app 3.06).
+            // 1.44 (B): START-aligned EXACTLY under the
+            // name (the 1.43 centring is reversed), text
+            // «Location : <flag> <Country> ▾» — flag
+            // BEFORE the name (the 1.43 flag-after-name
+            // order is reversed), small ▾ after it.
+            // 1.44 (B): the row's left edge IS the
+            // name's left edge — toggle width + toggle
+            // margin + the label column's start padding,
+            // all in px, so it stays aligned at any
+            // density (the name sits in labelCol after
+            // the toggle, inside the box's 16dp padding).
+            val nameIndentPx = (48 * 0.7f * d).toInt() +
+                (8 * 0.7f * d).toInt() + (24 * d).toInt()
+            val pickerRow = TextView(this).apply {
+                val flag = TunnelBear.flagEmoji(country)
+                text = if (flag.isEmpty()) "Location : $country ▾"
+                    else "Location : $flag $country ▾"
+                textSize = 15f
+                setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
+                textDirection = View.TEXT_DIRECTION_LTR
+                gravity = Gravity.START
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT)
+                setPadding(nameIndentPx, (10 * d).toInt(), 0, (4 * d).toInt())
+                isClickable = true
+                setOnClickListener {
+                    tbCountryMenuOpen = !tbCountryMenuOpen
+                    refreshList()
+                }
+            }
+            box.addView(pickerRow)
+            // Inline menu INSIDE the box: fixed-height
+            // ScrollView showing ~5 countries at a time.
+            if (tbCountryMenuOpen) {
+                val menuList = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    layoutDirection = View.LAYOUT_DIRECTION_LTR
+                }
+                // 1.43 (G): pinned countries FIRST, then
+                // alphabetical — the same order as the cards.
+                val pinnedMenu = TunnelBear.pinnedCountries(this)
+                val menuCountries = TunnelBear.countries(this).sortedWith(
+                    compareByDescending<String> { pinnedMenu.contains(it) }
+                        .thenBy { it.lowercase() })
+                for (c in menuCountries) {
+                    val isSel = c.equals(country, ignoreCase = true)
+                    val isPinned = pinnedMenu.contains(c)
+                    val row = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        layoutDirection = View.LAYOUT_DIRECTION_LTR
+                        layoutParams = LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT)
+                        isClickable = true
+                    }
+                    // 1.44 (D): [flag] [name] on the LEFT,
+                    // pin on the RIGHT edge (the 1.43 pin
+                    // between flag and name is moved).
+                    row.addView(TextView(this).apply {
+                        text = TunnelBear.flagEmoji(c)
+                        textSize = 16f
+                        textDirection = View.TEXT_DIRECTION_LTR
+                        gravity = Gravity.START
+                        layoutParams = LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.WRAP_CONTENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT)
+                        setPadding((12 * d).toInt(), (10 * d).toInt(), 0, (10 * d).toInt())
+                    })
+                    row.addView(TextView(this).apply {
+                        text = if (isSel) "✓ $c" else c
+                        textSize = 16f
+                        if (isSel) setTypeface(null, android.graphics.Typeface.BOLD)
+                        setTextColor(if (isSel) Color.parseColor("#2E9E5B") else OvpnTheme.fg(this@OpenVpnActivity))
+                        textDirection = View.TEXT_DIRECTION_LTR
+                        gravity = Gravity.START
+                        layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        setPadding((4 * d).toInt(), (10 * d).toInt(), (4 * d).toInt(), (10 * d).toInt())
+                    })
+                    // Pin at the RIGHT edge, small gap.
+                    // Its own click listener toggles the
+                    // pin ONLY — no select, no connect.
+                    row.addView(android.widget.ImageView(this).apply {
+                        setImageBitmap(OvpnTheme.pinBitmap(this@OpenVpnActivity,
+                            if (isPinned) "#2E9E6B" else "#9E9E9E", 16, isPinned))
+                        layoutParams = LinearLayout.LayoutParams(dp(16), dp(16)).apply {
+                            marginEnd = dp(8)
+                        }
+                        isClickable = true
+                        setOnClickListener {
+                            try {
+                                TunnelBear.setPinned(this@OpenVpnActivity, c, !isPinned)
+                            } catch (_: Exception) {}
+                            // Rebuilds the box (sig carries
+                            // the pinned set): the open menu
+                            // re-sorts pinned-first.
+                            renderTopBox()
+                        }
+                    })
+                    row.setOnClickListener {
+                        try {
+                            TunnelBear.saveSelectedCountry(this@OpenVpnActivity, c)
+                            TunnelBear.ensureSingleEntry(this@OpenVpnActivity)
+                            profiles = OvpnStore.load(this@OpenVpnActivity)
+                        } catch (_: Exception) {}
+                        tbCountryMenuOpen = false
+                        refreshList()
+                        refreshStatus()
+                    }
+                    menuList.addView(row)
+                }
+                box.addView(ScrollView(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        (5 * 44 * d).toInt())
+                    isVerticalScrollBarEnabled = true
+                    isNestedScrollingEnabled = true
+                    setOnTouchListener { v, ev ->
+                        when (ev.actionMasked) {
+                            android.view.MotionEvent.ACTION_DOWN,
+                            android.view.MotionEvent.ACTION_MOVE ->
+                                v.parent?.requestDisallowInterceptTouchEvent(true)
+                            android.view.MotionEvent.ACTION_UP,
+                            android.view.MotionEvent.ACTION_CANCEL ->
+                                v.parent?.requestDisallowInterceptTouchEvent(false)
+                        }
+                        false
+                    }
+                    addView(menuList)
+                })
+            }
+        } catch (_: Exception) {}
+    }
+
+    /** 1.41 (E): the status label, main-app style —
+     *  "CONNECTED: <name>" (green), "CONNECTING:
+     *  <name>  [state] [OpenVPN3]" (orange) or
+     *  "DISCONNECTED" (steel/teal). A sweep measurement
+     *  must never rewrite it (v1.20). The name is the
+     *  display name (never the raw "TunnelBear"). */
+    private fun renderStatusLabel() {
+        val label = statusLabel ?: return
+        val dark = OvpnTheme.isDark(this)
+        val connecting = OvpnEngine.isConnecting
+        val connected = OvpnEngine.isConnected
+        val name = OvpnEngine.activeName
+        when {
+            connected && name != null -> {
+                label.text = "CONNECTED: " + TunnelBear.displayNameForStored(name)
+                label.setTextColor(Color.parseColor("#2E9E5B"))
+            }
+            connecting && name != null -> {
+                val st = OvpnEngine.lastState
+                label.text = if (st != null)
+                    "CONNECTING: " + TunnelBear.displayNameForStored(name) + "  [$st] [OpenVPN3]"
+                else
+                    "CONNECTING: " + TunnelBear.displayNameForStored(name) + " [OpenVPN3]"
+                label.setTextColor(Color.parseColor("#E67E22"))
+            }
+            else -> {
+                label.text = "DISCONNECTED"
+                label.setTextColor(Color.parseColor(if (dark) "#26A69A" else "#5B7A99"))
+            }
+        }
+    }
+
+    /** 1.41 (E): the top box's main-part tap — the old
+     *  free-tab orb tap (onOrbTap's free branch), moved
+     *  to the box. No account → create one; creating →
+     *  toast (the waiting dialog has its own cancel);
+     *  connecting → cancel; connected → disconnect;
+     *  SMART → smartConnect(); else connectProfile(tb). */
+    private fun onFreeEntryTap() {
+        val p = tbProfile()
+        if (!TunnelBear.hasAccount(this)) {
+            startTbAutoCreation()
+            return
+        }
+        if (p == null) return
+        if (tbCreating) {
+            android.widget.Toast.makeText(this,
+                L("لطفا کمی صبر کنید", "Please wait a moment"),
+                android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        // v1.12: tapping WHILE connecting CANCELS the
+        // attempt (item 3) — the old code just started
+        // a second ladder over the first one.
+        if (OvpnEngine.isConnecting && OvpnEngine.activeName == TunnelBear.SINGLE_NAME) {
+            cancelCurrentConnect()
+            return
+        }
+        if (freeConnected()) {
+            OvpnEngine.disconnect()
+            refreshStatus(); refreshList()
+        } else if (TunnelBear.isSmartSelection(this)) {
+            // v1.26: Smart Connect — the app picks the
+            // best location itself (first pinned, else
+            // the default country). No checking.
+            smartConnect()
+        } else {
+            connectProfile(p)
+        }
+    }
+
+
+
+
+
+
+    // 1.41: the status label NEVER shows a connect
+    // error (log only) — same rule as the old status
+    // line.
+    // ---------- «راهنمای اتصال» guided tutorial (v1.6, v1.7, v1.8) ----------
+    // 1.36: the same interactive spotlight pattern as the
+    // v2ray tutorial — the page dims 80% except the
+    // target, and every step has a «رد کردن» skip. The
+    // bright target IS the pointer: nothing is drawn
+    // around it. The tutorial advances only by tapping
+    // the target or by real state changes.
+    // 1.40: the guide button STAYS — the 1.7 rule that
+    // hid it for good after the first free connection
+    // is dropped at the user's «برشگردون» order.
+    // 1.41: the floating guide button is GONE — the
+    // entries are the header "?" and the top box's
+    // guide third. Steps follow the REAL free flow:
+    //  1. top box — turn your own VPN on, tap the box
+    //     to start creating the free account.
+    //  2. top box — wait while the account is created.
+    //  4. Top-box toggle — tap it to connect (shown
+    //     only when not already connected; if the
+    //     auto-connect already connected, the tutorial
+    //     simply ends). A failed step-4 connect ENDS
+    //     the guide (no country to pick anymore).
+    // v1.12: while the guide is active, the account does NOT
+    // auto-connect on creation (handleCreationReady) — the
+    // guide walks the whole post-creation flow instead.
+    // The state machine (checkGuideState, driven by the 2s
+    // poller + a check after every forwarded target tap)
+    // advances/retreats from the real state, so the tutorial
+    // can never point at a step whose precondition is gone.
+    // 1.41: steps 1/2 spotlight the top box's main
+    // part (tap = create the account); step 4
+    // spotlights the top box's connect toggle
+    // (1.42: the TB card is gone).
+    // Steps 3/5 (country picking) are gone.
+    private fun guideTargetView(step: Int): View? = when (step) {
+        1, 2 -> topBoxMain
+        4 -> tbToggleView
+        else -> null
+    }
+
+    private fun guideTitle(step: Int): String =
+        T("راهنمای ساخت اکانت - مرحله $step",
+            "Account guide — step $step",
+            "Руководство — шаг $step")
+
+    /** v1.8: the target's name is BOLD in accent colour
+     *  inside the box text («باکس ساخت اکانت» /
+     *  «دکمه اتصال») — the bright target plus its bold
+     *  name IS the pointer now. Step 2 has no target
+     *  name. 1.41: the country steps (3/5) are gone. */
+    private fun guideText(step: Int): CharSequence = when (step) {
+        1 -> boldTarget(
+            T("اول فیلترشکن خودت را روشن کن، بعد روی ", "First turn on your own VPN, then tap the ", "Сначала включите свой VPN, затем нажмите на "),
+            T("باکس ساخت اکانت", "account box", "окно создания аккаунта"),
+            T(" بزن.", ".", "."))
+        2 -> T("کمی صبر کنید تا اکانت رایگان ساخته بشود",
+            "Please wait while the free account is being created.",
+            "Подождите, создаётся бесплатный аккаунт.")
+        else -> boldTarget(
+            T("حالا روی ", "Now tap the ", "Теперь нажмите на "),
+            T("دکمه اتصال", "connect button", "кнопку подключения"),
+            T(" بزن تا وصل شوی.", " to connect.", ", чтобы подключиться."))
+    }
+
+    private fun boldTarget(prefix: String, target: String, suffix: String): CharSequence {
+        val sb = android.text.SpannableStringBuilder()
+        sb.append(prefix)
+        val start = sb.length
+        sb.append(target)
+        sb.setSpan(android.text.style.StyleSpan(android.graphics.Typeface.BOLD),
+            start, sb.length, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        sb.setSpan(android.text.style.ForegroundColorSpan(OvpnTheme.accent(this)),
+            start, sb.length, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        sb.append(suffix)
+        return sb
+    }
+
+
+    private fun startGuide() {
+        if (guideStep > 0) return
+        // 1.40: the old `|| TunnelBear.hasFirstFreeConnection(this)`
+        // guard refused to start the tutorial once the user had
+        // ever connected for free — together with the old
+        // guide button's hide rule, that is why the guide
+        // was gone. The user's «برشگردون» order drops it:
+        // the guide opens any time, from the real state.
+        // 1.41: start from the real state — a fresh user
+        // starts at account creation (1); a user who
+        // already has an account starts at connect (4).
+        // The country-picking start (3) is gone with
+        // the country chip.
+        val first = when {
+            !TunnelBear.hasAccount(this) -> 1
+            freeConnected() -> return
+            else -> 4
+        }
+        guideStep = first
+        guideStep4Tried = false
+        buildGuideOverlay()
+        showGuideStep(first)
+    }
+
+    private fun endGuide() {
+        guideStep = 0
+        guideStep4Tried = false
+        removeGuideStep2Window()
+        try { guideOverlay?.let { rootFrame.removeView(it) } } catch (_: Exception) {}
+        guideOverlay = null
+        guideDimView = null
+        guideBox = null
+        guideBoxTitle = null
+        guideBoxText = null
+    }
+
+    /** v1.7: the first free-tunnel connection ends the
+     *  tutorial for good — mark it, close the guide
+     *  (1.40: the BUTTON no longer hides with it —
+     *  it stays on the Free tab). Called from the state
+     *  machine and from the poller (so it also fires
+     *  when the guide was never opened). */
+    private fun noteFirstFreeConnection() {
+        try {
+            // v1.20: ALWAYS persist the flag when a real free
+            // connect is observed — the old `if (!has...)`
+            // guard skipped the write whenever the 7-day dial
+            // seed was true, so the pref was NEVER stored and
+            // the flag depended on the volatile dial seed: a
+            // failed dial (a failed user tap, or a failed
+            // sweep measurement overwriting the last success)
+            // flipped it false, so the guide button reappeared
+            // (and, before 1.72 moved it to Home, the speed box
+            // hid until the next successful dial). The pref, once
+            // written, is the source of truth; the seed stays
+            // only as a fallback.
+            TunnelBear.markFirstFreeConnection(this)
+        } catch (_: Exception) {}
+        // 1.71 (item 3): this is the exact moment a free
+        // tunnel is observed CONNECTED — record which
+        // country it is, so the widget resolves to the
+        // last-CONNECTED free location.
+        try { recordLastFreeCountry() } catch (_: Exception) {}
+        if (guideStep > 0) endGuide()
+        renderTopBox()
+    }
+
+    // ---------- 1.71 item 3: widget connects to the LAST-CONNECTED free location ----------
+    // The widget opens this activity with
+    // widget_auto_connect=true (WidgetProviderBase.
+    // openSectionActivity), but this activity NEVER read
+    // that extra — the tap just opened the page and did
+    // nothing. And the widget's own target
+    // (WidgetProviderBase.lastOvpnProfile) resolves by
+    // the stored profile NAME "ovpn_last", while the
+    // single free entry's CONTENT follows the latest
+    // PICK (the country menu saves the pick and rebuilds
+    // the entry at once) — so after picking a country
+    // without connecting, the widget would have connected
+    // the picked-but-never-connected location, not the
+    // last-connected one. The fix, activity-side: record
+    // the country of the free tunnel that actually reaches
+    // CONNECTED (recordLastFreeCountry, called from
+    // noteFirstFreeConnection — the exact CONNECTED
+    // observation) under LAST_FREE_COUNTRY_KEY in the
+    // same "renamer_ovpn" prefs, and make the widget tap
+    // connect the free entry built for THAT country
+    // (handleWidgetAutoConnect). The provider side reads
+    // the same key (another worker). Narrow edge: if the
+    // free tunnel was connected by another component
+    // (Smart service) this process never ran
+    // connectProfile, so the record falls back to
+    // selectedCountry at CONNECTED time — still the
+    // connected location unless the user picked another
+    // country mid-connection.
+
+    /** The last-CONNECTED free country ("renamer_ovpn"
+     *  pref LAST_FREE_COUNTRY_KEY), or null when the
+     *  free entry never connected yet. Only a real
+     *  47-list country counts. */
+    private fun lastFreeCountry(): String? {
+        return try {
+            getSharedPreferences("renamer_ovpn", MODE_PRIVATE)
+                .getString(LAST_FREE_COUNTRY_KEY, null)
+                ?.takeIf { it.isNotBlank() && TunnelBear.isKnownCountry(this, it) }
+        } catch (_: Exception) { null }
+    }
+
+    /** Record the country of the free tunnel that just
+     *  reached CONNECTED. The attempt's country was
+     *  captured at connect start (connectingFreeCountry
+     *  — a pick made DURING the connect must not move
+     *  the record); when this process never ran
+     *  connectProfile for it (Smart service), fall back
+     *  to the selection at CONNECTED time. */
+    private fun recordLastFreeCountry() {
+        val country = connectingFreeCountry
+            ?.takeIf { TunnelBear.isKnownCountry(this, it) }
+            ?: TunnelBear.selectedCountry(this)
+                .takeIf { TunnelBear.isKnownCountry(this, it) }
+            ?: return
+        try {
+            getSharedPreferences("renamer_ovpn", MODE_PRIVATE).edit()
+                .putString(LAST_FREE_COUNTRY_KEY, country).apply()
+        } catch (_: Exception) {}
+    }
+
+    /** Widget tap: auto-connect 600ms after the page
+     *  opens (the VpnActivity pattern), once per
+     *  activity instance. Fires from onCreate (fresh
+     *  instance — the normal widget-tap path) and from
+     *  onNewIntent (activity already alive). */
+    private fun handleWidgetAutoConnect() {
+        if (widgetAutoConnectDone) return
+        if (!intent.getBooleanExtra("widget_auto_connect", false)) return
+        widgetAutoConnectDone = true
+        handler.postDelayed({
+            try {
+                if (isFinishing || isDestroyed) return@postDelayed
+                if (OvpnEngine.isConnected || OvpnEngine.isConnecting) return@postDelayed
+                if (tbCreating) return@postDelayed
+                connectWidgetLastFree()
+            } catch (_: Exception) {}
+        }, 600)
+    }
+
+    /** Connect the free entry built for the
+     *  LAST-CONNECTED free country — never the
+     *  last-picked-but-never-connected one. When no
+     *  free connection was ever recorded, behave like
+     *  an in-app tap (Smart re-picks, otherwise the
+     *  selected / default location). Aligning the
+     *  selection to the connected country keeps the
+     *  box, log and chip truthful; a SMART selection
+     *  stays SMART (only the smart choice moves). */
+    private fun connectWidgetLastFree() {
+        val target = lastFreeCountry()
+        if (target == null) {
+            if (TunnelBear.isSmartSelection(this)) { smartConnect(); return }
+            val p = tbProfile() ?: return
+            connectProfile(p)
+            return
+        }
+        try {
+            if (TunnelBear.isSmartSelection(this)) {
+                if (target != TunnelBear.smartChoice(this)) {
+                    TunnelBear.saveSmartChoice(this, target)
+                    TunnelBear.ensureSingleEntry(this)
+                    profiles = OvpnStore.load(this)
+                }
+            } else if (target != TunnelBear.selectedCountry(this)) {
+                TunnelBear.saveSelectedCountry(this, target)
+                TunnelBear.ensureSingleEntry(this)
+                profiles = OvpnStore.load(this)
+            }
+        } catch (_: Exception) {}
+        val p = tbProfile() ?: return
+        connectProfile(p)
+    }
+
+    /** Advance/retreat from the REAL state. Called by the
+     *  2s poller and after every forwarded target tap.
+     *  1.41: steps 3/5 (country picking) are gone — step
+     *  2 goes straight to step 4 (connect), and a
+     *  failed step-4 connect ENDS the guide (there is
+     *  no other location to pick; the toggle stays
+     *  tappable and the failure is in the log). */
+    private fun checkGuideState() {
+        if (guideStep <= 0) return
+        if (guideStep == 1 && tbCreating) { showGuideStep(2); return }
+        if (guideStep == 2) {
+            if (TunnelBear.hasAccount(this)) { showGuideStep(4); return }
+            if (!tbCreating) { showGuideStep(1); return }
+        }
+        if (guideStep in 1..2 && TunnelBear.hasAccount(this)) { showGuideStep(4); return }
+        if (guideStep == 4 && freeConnected()) { noteFirstFreeConnection(); endGuide(); return }
+        // 1.41: remember that the user really tried step 4's
+        // connect, so a stale lastError cannot end the guide.
+        if (guideStep == 4 && OvpnEngine.isConnecting) guideStep4Tried = true
+        // 1.41: the step-4 connect failed (and is not
+        // still trying) — end the guide; the user can
+        // tap the toggle again, and the failure line
+        // is in the app log.
+        if (guideStep == 4 && guideStep4Tried && !OvpnEngine.isConnecting && !freeConnected()
+            && OvpnEngine.lastError != null) {
+            endGuide()
+            return
+        }
+    }
+
+    private fun showGuideStep(n: Int) {
+        if (guideOverlay == null) return
+        guideStep = n
+        if (n == 2) {
+            // v1.8: the waiting step has no pointer and
+            // its box is a second dialog above the
+            // waiting dialog (the v1.7 attached window
+            // still sat under that dialog's dim and came
+            // out faded on the phone). The overlay box
+            // stays hidden for this step.
+            guideBox?.visibility = View.GONE
+            guideOverlay?.post { positionGuideBox() }
+            showGuideStep2Window()
+            return
+        }
+        removeGuideStep2Window()
+        guideBoxTitle?.text = guideTitle(n)
+        guideBoxText?.text = guideText(n)
+        guideBox?.visibility = View.INVISIBLE
+        guideOverlay?.post { positionGuideBox() }
+    }
+
+    /** v1.8: step 2's box is a SECOND dialog, shown AFTER
+     *  the waiting dialog. WHY this provably sits above
+     *  the waiting dialog's dim: both dialogs are plain
+     *  top-level windows of the same type
+     *  (TYPE_APPLICATION), and the WindowManager stacks
+     *  same-type windows in insertion order — the later
+     *  one is on top. The waiting dialog's dim is a layer
+     *  attached BELOW its own window, so anything in a
+     *  later top-level window renders above that dim.
+     *  (v1.7's TYPE_APPLICATION_ATTACHED_DIALOG window
+     *  was a sub-window of the ACTIVITY, not of the
+     *  dialog — the dialog's dim covered it, which is
+     *  why the box still came out faded on the phone.)
+     *  This dialog adds no dim of its own (dimAmount 0)
+     *  and its window background is transparent, so only
+     *  the opaque pill shows — fully bold in day and
+     *  night. It is not cancelable and never takes
+     *  touches outside the pill (FLAG_NOT_TOUCH_MODAL).
+     *  The text is just the one sentence the user
+     *  asked for, plus a 1.36 «رد کردن» — the waiting
+     *  step has a skip now, like every other step. */
+    private fun showGuideStep2Window() {
+        if (guideStep2Dialog?.isShowing == true) return
+        if (isFinishing || isDestroyed) return
+        try {
+            val outer = FrameLayout(this).apply {
+                setPadding(dp(16), 0, dp(16), 0)
+            }
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = OvpnTheme.dialogCard(this@OpenVpnActivity)
+                setPadding(dp(16), dp(13), dp(10), dp(13))
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT)
+            }
+            val tv = TextView(this).apply {
+                text = guideText(2)
+                textSize = 14f
+                setTypeface(null, android.graphics.Typeface.BOLD)
                 setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
                 textDirection = appTextDir()
                 gravity = Gravity.START
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                    marginStart = dp(6)
-                }
+                layoutParams = LinearLayout.LayoutParams(0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            box.addView(tv)
+            // 1.36: skip on the waiting step too.
+            box.addView(TextView(this).apply {
+                text = T("رد کردن", "Skip", "Пропустить")
+                textSize = 12f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setTextColor(OvpnTheme.accent(this@OpenVpnActivity))
+                textDirection = appTextDir()
+                gravity = Gravity.CENTER
+                setPadding(dp(10), dp(4), dp(2), dp(4))
+                isClickable = true
+                setOnClickListener { endGuide() }
             })
-            panel.addView(r)
-        }
-        row("📋", "لاگ برنامه", "App log") { closeDrawer(); showLogDialog() }
-        row("؟", "راهنما", "Guide") { closeDrawer(); showOvpnGuide() }
-        row(OvpnTheme.modeGlyph(this), "حالت شب/روز", "Day / night") {
-            OvpnTheme.cycleMode(this)
-            recreate()
-        }
-        row("🌐", "زبان برنامه", "App language") { showLanguageDialog() }
-        row("ℹ️", "درباره ما", "About") { showAboutOverlay() }
-        root.addView(panel)
+            outer.addView(box)
+            val dlg = android.app.Dialog(this).apply {
+                setContentView(outer)
+                setCancelable(false)
+                setCanceledOnTouchOutside(false)
+            }
+            val win = dlg.window
+            if (win != null) {
+                win.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT))
+                win.setDimAmount(0f)
+                win.addFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL)
+                val lp = win.attributes
+                lp.width = android.view.WindowManager.LayoutParams.MATCH_PARENT
+                lp.height = android.view.WindowManager.LayoutParams.WRAP_CONTENT
+                lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                lp.y = dp(48)
+                win.attributes = lp
+            }
+            guideStep2Dialog = dlg
+            dlg.show()
+        } catch (_: Exception) {}
     }
 
-    private fun openDrawer() {
-        if (drawerOpen) return
-        drawerOpen = true
-        drawerScrim?.visibility = View.VISIBLE
-        drawerScrim?.animate()?.alpha(0.55f)?.setDuration(200)?.start()
-        drawerPanel?.animate()?.translationX(0f)?.setDuration(250)?.start()
+    private fun removeGuideStep2Window() {
+        try { guideStep2Dialog?.dismiss() } catch (_: Exception) {}
+        guideStep2Dialog = null
     }
 
-    private fun closeDrawer() {
-        if (!drawerOpen) return
-        drawerOpen = false
-        drawerScrim?.animate()?.alpha(0f)?.setDuration(200)
-            ?.withEndAction { drawerScrim?.visibility = View.GONE }?.start()
-        drawerPanel?.animate()?.translationX(-(drawerWidthPx + dp(20)).toFloat())?.setDuration(250)?.start()
-    }
-
-    /** Language chooser: English / فارسی / Русский,
-     *  checkmark on the current one; tap switches
-     *  the WHOLE app immediately (activity recreates). */
-    private fun showLanguageDialog() {
-        val col = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-        }
-        val cur = AppLanguage.lang(this)
-        val langs = listOf(
-            "fa" to "فارسی",
-            "en" to "English",
-            "ru" to "Русский"
-        )
-        for ((code, name) in langs) {
-            col.addView(TextView(this).apply {
-                text = (if (code == cur) "✓ " else "    ") + name
-                textSize = 16f
-                setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
-                textDirection = View.TEXT_DIRECTION_LOCALE
-                gravity = Gravity.START
-                setPadding(dp(16), dp(13), dp(16), dp(13))
-                setOnClickListener {
-                    try { AppLanguage.set(this@OpenVpnActivity, code) } catch (_: Exception) {}
-                    try { recreate() } catch (_: Exception) {}
-                }
-            })
-        }
-        android.app.AlertDialog.Builder(this)
-            .setTitle(L("زبان برنامه", "App language"))
-            .setView(col)
-            .setNegativeButton(L("لغو", "Cancel"), null)
-            .show().also { OvpnTheme.styleDialog(it, this) }
-    }
-
-    /** About page over the main page + opened menu,
-     *  with a BLURRED background (RenderEffect where
-     *  available, else a dim scrim). Tapping the
-     *  channel ID opens the Telegram channel. */
-    private fun showAboutOverlay() {
-        if (aboutOverlay != null) return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            try {
-                pageView?.setRenderEffect(
-                    RenderEffect.createBlurEffect(18f, 18f, Shader.TileMode.CLAMP))
-            } catch (_: Exception) {}
-            try {
-                drawerPanel?.setRenderEffect(
-                    RenderEffect.createBlurEffect(18f, 18f, Shader.TileMode.CLAMP))
-            } catch (_: Exception) {}
-        }
+    private fun buildGuideOverlay() {
         val overlay = FrameLayout(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT)
-            setBackgroundColor(Color.parseColor("#99000000"))
-            setOnClickListener { hideAboutOverlay() }
+            isClickable = true
+            isFocusable = true
         }
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutDirection = rtlDir()
-            background = OvpnTheme.dialogCard(this@OpenVpnActivity)
-            // v1.2: WIDER card — the 300dp card made the
-            // «channel + ID» line wrap to two lines. Full
-            // width minus 16dp margins, so the one-line
-            // channel row has maximum room.
+        val dim = GuideOverlayView(this).apply {
+            // 1.36: 80% dim (was 60%) — the page goes
+            // dark except the spotlight hole.
+            dimColor = Color.parseColor("#CC000000")
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT).apply {
-                gravity = Gravity.CENTER
-                setMargins(dp(16), 0, dp(16), 0)
-            }
-            setPadding(dp(20), dp(24), dp(20), dp(24))
-            setOnClickListener { /* consume: tap on the card does not close */ }
+                FrameLayout.LayoutParams.MATCH_PARENT)
         }
-        card.addView(TextView(this).apply {
-            text = L("درباره ما", "About")
-            textSize = 20f
+        guideDimView = dim
+        overlay.addView(dim)
+        // Small box: header + 1–2 lines.
+        // 1.36: «رد کردن» in the header — the tutorial
+        // exits at any step now (v1.10 had no ✕ on
+        // purpose; the user ordered a skip). Exiting
+        // never hides the guide button: it stays until
+        // the first free connection.
+        // v1.7: no «بعدی» button — the tutorial advances
+        // only by tapping the target or by real state
+        // changes.
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = OvpnTheme.glassCard(this@OpenVpnActivity, 16f)
+            layoutParams = FrameLayout.LayoutParams(dp(280),
+                FrameLayout.LayoutParams.WRAP_CONTENT)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            visibility = View.INVISIBLE
+        }
+        val headRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = rtlDir()
+        }
+        guideBoxTitle = TextView(this).apply {
+            textSize = 13.5f
             setTypeface(null, android.graphics.Typeface.BOLD)
             setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
             textDirection = appTextDir()
             gravity = Gravity.START
-            setPadding(0, 0, 0, dp(16))
-        })
-        card.addView(TextView(this).apply {
-            text = L("سازنده: کامیار", "Made by: Kamyar")
-            textSize = 15f
-            setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
-            textDirection = appTextDir()
-            gravity = Gravity.START
-            setPadding(0, 0, 0, dp(12))
-        })
-        // v1.3: ROOT CAUSE of the v1.2 invisible row —
-        // setSingleLine(true) switches the TextView to
-        // horizontal-scrolling mode; with textDirection
-        // RTL (fa) on a WRAP_CONTENT-width view inside
-        // the RTL card, the single-line layout scrolls
-        // the mixed RTL+Latin line out of the visible
-        // viewport — the view keeps its measured height
-        // (the empty gap in the screenshot) while no
-        // glyph draws. The post-layout textSize-mutation
-        // loop compounded it by re-triggering layout
-        // after placement. v1.1's two-TextView row (no
-        // setSingleLine, no LinkMovementMethod, no post
-        // mutation) RENDERED on device. Fix: plain
-        // single TextView, NO setSingleLine, NO
-        // LinkMovementMethod, NO ClickableSpan, NO
-        // post-layout mutation. The ID keeps its link
-        // look (underline + bold + accent) via visual
-        // spans only; the whole row is clickable and
-        // opens the Telegram channel. If the line is
-        // too long for a narrow screen it WRAPS to two
-        // lines (as v1.1 did) rather than vanishing —
-        // VISIBILITY BEATS ONE-LINE.
-        val channelId = "@internet_azad_2026"
-        val channelLabel = T("کانال تلگرام و ارتباط با ما: ",
-            "Telegram channel and contact: ",
-            "Канал Telegram и связь с нами: ")
-        val channelView = TextView(this).apply {
-            textSize = 14f
-            setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
-            textDirection = appTextDir()
-            gravity = Gravity.START
-            setPadding(0, dp(10), 0, dp(10))
-            val span = android.text.SpannableStringBuilder().apply {
-                append(channelLabel)
-                val start = length
-                append(channelId)
-                setSpan(android.text.style.UnderlineSpan(), start, length,
-                    android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                setSpan(android.text.style.StyleSpan(android.graphics.Typeface.BOLD), start, length,
-                    android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                setSpan(android.text.style.ForegroundColorSpan(OvpnTheme.accent(this@OpenVpnActivity)),
-                    start, length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            }
-            text = span
-            setOnClickListener { openTelegramChannel() }
+            layoutParams = LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        card.addView(channelView)
-        card.addView(TextView(this).apply {
-            text = L("بستن", "Close")
-            textSize = 15f
+        headRow.addView(guideBoxTitle)
+        // 1.36: skip — exits the tutorial at any step.
+        headRow.addView(TextView(this).apply {
+            text = T("رد کردن", "Skip", "Пропустить")
+            textSize = 12f
             setTypeface(null, android.graphics.Typeface.BOLD)
             setTextColor(OvpnTheme.accent(this@OpenVpnActivity))
+            textDirection = appTextDir()
             gravity = Gravity.CENTER
-            setPadding(0, dp(18), 0, 0)
-            setOnClickListener { hideAboutOverlay() }
+            setPadding(dp(8), dp(4), dp(0), dp(4))
+            isClickable = true
+            setOnClickListener { endGuide() }
         })
-        overlay.addView(card)
+        box.addView(headRow)
+        guideBoxText = TextView(this).apply {
+            textSize = 13f
+            setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
+            textDirection = appTextDir()
+            gravity = Gravity.START
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
+        }
+        box.addView(guideBoxText)
+        guideBox = box
+        overlay.addView(box)
+        // Taps: on the target → perform its real click and
+        // re-check the state shortly after; on the box →
+        // the box's own buttons (they are children, so this
+        // listener only fires for touches no child consumed);
+        // anywhere else → swallowed, the tutorial blocks them.
+        overlay.setOnTouchListener { _, ev ->
+            if (ev.action == android.view.MotionEvent.ACTION_UP) {
+                val target = guideTargetView(guideStep)
+                if (target != null) {
+                    val loc = IntArray(2)
+                    target.getLocationOnScreen(loc)
+                    val inTarget = ev.rawX >= loc[0] && ev.rawX <= loc[0] + target.width &&
+                        ev.rawY >= loc[1] && ev.rawY <= loc[1] + target.height
+                    if (inTarget) {
+                        try { target.performClick() } catch (_: Exception) {}
+                        handler.postDelayed({ checkGuideState() }, 600)
+                    }
+                }
+            }
+            true
+        }
         rootFrame.addView(overlay)
-        aboutOverlay = overlay
+        guideOverlay = overlay
     }
 
-    private fun hideAboutOverlay() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            try { pageView?.setRenderEffect(null) } catch (_: Exception) {}
-            try { drawerPanel?.setRenderEffect(null) } catch (_: Exception) {}
+    /** Position the small box for the current step and cut
+     *  the spotlight hole around the target. Below the
+     *  target when it fits, else above; step 2 (the
+     *  centred waiting dialog) has no box — the second
+     *  dialog carries the text. Never covers the target
+     *  itself. */
+    private fun positionGuideBox() {
+        val overlay = guideOverlay ?: return
+        val dim = guideDimView ?: return
+        val box = guideBox ?: return
+        val target = guideTargetView(guideStep) ?: return
+        val oloc = IntArray(2)
+        overlay.getLocationOnScreen(oloc)
+        val tloc = IntArray(2)
+        target.getLocationOnScreen(tloc)
+        val targetRect = RectF(
+            (tloc[0] - oloc[0]).toFloat(), (tloc[1] - oloc[1]).toFloat(),
+            (tloc[0] - oloc[0] + target.width).toFloat(),
+            (tloc[1] - oloc[1] + target.height).toFloat())
+        if (guideStep == 2) {
+            // v1.8: no box, no pointer on the waiting step —
+            // the second dialog above the waiting dialog
+            // carries the text. The veil stays (it blocks
+            // page taps while the account is being created)
+            // and the hole keeps the top box bright
+            // behind the dialog.
+            dim.targetRect = targetRect
+            dim.invalidate()
+            return
         }
-        val ov = aboutOverlay ?: return
-        aboutOverlay = null
-        try { rootFrame.removeView(ov) } catch (_: Exception) {}
+        val wSpec = View.MeasureSpec.makeMeasureSpec(dp(280), View.MeasureSpec.AT_MOST)
+        val hSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        box.measure(wSpec, hSpec)
+        val bw = box.measuredWidth
+        val bh = box.measuredHeight
+        val ow = overlay.width
+        val oh = overlay.height
+        if (ow <= 0 || oh <= 0 || bw <= 0 || bh <= 0) return
+        val margin = dp(16)
+        val gap = dp(14)
+        val bx = (targetRect.centerX() - bw / 2f).toInt()
+            .coerceIn(margin, (ow - bw - margin).coerceAtLeast(margin))
+        var by = run {
+            val below = (targetRect.bottom + gap).toInt()
+            if (below + bh <= oh - dp(24)) below
+            else (targetRect.top - gap - bh).toInt().coerceAtLeast(dp(24))
+        }
+        by = by.coerceIn(dp(24), (oh - bh - dp(24)).coerceAtLeast(dp(24)))
+        (box.layoutParams as? FrameLayout.LayoutParams)?.let {
+            it.width = bw
+            it.height = bh
+            it.leftMargin = bx
+            it.topMargin = by
+            it.gravity = Gravity.TOP or Gravity.START
+            box.layoutParams = it
+        }
+        box.visibility = View.VISIBLE
+        dim.targetRect = targetRect
+        dim.invalidate()
     }
+
 
     /** v1.2: open the Telegram channel WITH THE
      *  TELEGRAM APP when it is installed — never the
@@ -1041,178 +1794,19 @@ class OpenVpnActivity : Activity() {
     private fun freeConnected(): Boolean =
         OvpnEngine.isConnected && OvpnEngine.activeName == TunnelBear.SINGLE_NAME
 
-    private fun openConnected(): Boolean {
-        val sel = selectedProfileObj() ?: return false
-        return OvpnEngine.isConnected && OvpnEngine.activeName == sel.name
-    }
-
-    private fun onOrbTap() {
-        if (tab == "free") {
-            val p = tbProfile()
-            if (!TunnelBear.hasAccount(this)) {
-                startTbAutoCreation()
-                return
-            }
-            if (p == null) return
-            if (freeConnected()) {
-                OvpnEngine.disconnect()
-                refreshStatus(); refreshList()
-            } else {
-                connectProfile(p)
-            }
-            return
-        }
-        val sel = selectedProfileObj()
-        // v1.1: no profile selected -> the orb does
-        // nothing (it shows «No profile selected»).
-        if (sel == null) return
-        if (openConnected()) {
-            OvpnEngine.disconnect()
-            refreshStatus(); refreshList()
-        } else {
-            connectProfile(sel)
-        }
-    }
-
-    // v1.1 free-orb tint (same glass texture, only
-    // the tint changes, all light/pale): no account
-    // yet = light blue, account but not connected =
-    // light red, connected = light green. The ring
-    // and glow follow the same state colour.
-    private fun freeOrbTint(): Int = when {
-        freeConnected() -> Color.parseColor("#8ED6A8")
-        TunnelBear.hasAccount(this) -> Color.parseColor("#F2A0A0")
-        else -> Color.parseColor("#8EC9EE")
-    }
-
-    // v1.2 open-orb tint: the SAME state tints as the
-    // free orb (same glass texture, ring/glow follow):
-    // no profile selected = light blue, profile
-    // selected but not connected = light red,
-    // connected = light green.
-    private fun openOrbTint(): Int = when {
-        openConnected() -> Color.parseColor("#8ED6A8")
-        selectedProfileObj() != null -> Color.parseColor("#F2A0A0")
-        else -> Color.parseColor("#8EC9EE")
-    }
-
-    private fun renderOrb() {
-        val dark = OvpnTheme.isDark(this)
-        val connecting = OvpnEngine.isConnecting
-        val connected = if (tab == "free") freeConnected() else openConnected()
-        applyOrbSize()
-        val tint = if (tab == "free") freeOrbTint() else openOrbTint()
-        orbView?.background = OvpnTheme.orbBackground(this, connected, tint)
-        glowView?.background = OvpnTheme.glowDrawable(this, connected, tint)
-        ringArcView?.background = if (tint != null) OvpnTheme.ringArcDrawableTinted(this, tint)
-            else OvpnTheme.ringArcDrawable(this)
-        orbPct?.visibility = View.GONE
-        if (tab == "free") {
-            val hasAccount = TunnelBear.hasAccount(this)
-            if (tbCreating) {
-                orbIcon?.visibility = View.GONE
-                orbBig?.textSize = 19f
-                orbBig?.text = L("لطفا کمی صبر کنید", "Please wait a moment")
-                orbSmall?.text = "."
-                orbPct?.visibility = View.VISIBLE
-                orbPct?.text = "0٪"
-                countryChip?.visibility = View.GONE
-            } else if (!hasAccount) {
-                orbIcon?.visibility = View.VISIBLE
-                orbBig?.textSize = 28f
-                orbBig?.text = L("دریافت", "Get")
-                orbSmall?.text = L("اکانت رایگان", "Free account")
-                countryChip?.visibility = View.GONE
-            } else {
-                orbIcon?.visibility = View.GONE
-                orbBig?.textSize = 28f
-                val country = TunnelBear.selectedCountry(this)
-                if (connecting && OvpnEngine.activeName == TunnelBear.SINGLE_NAME) {
-                    orbBig?.text = L("در حال اتصال", "Connecting")
-                    orbSmall?.text = OvpnEngine.lastState ?: ""
-                } else {
-                    orbBig?.text = if (connected) L("توقف", "Stop") else L("اتصال", "Connect")
-                    // v1.5: the country suffix only when a real
-                    // country is picked — never the raw entry
-                    // name, never an unpicked default.
-                    orbSmall?.text = if (connected) {
-                        if (TunnelBear.hasSelectedCountry(this)) L("متصل — ", "Connected — ") + TunnelBear.displayCountry(country)
-                        else L("متصل", "Connected")
-                    } else L("برای اتصال روی دایره بزن", "Tap the circle to connect")
-                }
-                countryChip?.visibility = View.VISIBLE
-                // v1.2: the chip NEVER shows a provider
-                // name. Until a country is picked it
-                // reads «انتخاب کشور»; ONCE picked it
-                // shows the selected country's FLAG +
-                // NAME (this corrects the v1.1 literal
-                // «always انتخاب کشور» reading).
-                countryChip?.text = if (TunnelBear.hasSelectedCountry(this))
-                    TunnelBear.displayCountry(country) + "  ▾"
-                else
-                    T("انتخاب کشور", "Choose country", "Выбрать страну") + "  ▾"
-            }
-        } else {
-            val sel = selectedProfileObj()
-            orbIcon?.visibility = View.GONE
-            countryChip?.visibility = View.GONE
-            orbBig?.textSize = 28f
-            if (sel == null) {
-                orbBig?.text = L("اتصال", "Connect")
-                orbSmall?.text = L("پروفایلی انتخاب نشده", "No profile selected")
-            } else if (connecting && OvpnEngine.activeName == sel.name) {
-                orbBig?.text = L("در حال اتصال", "Connecting")
-                orbSmall?.text = OvpnEngine.lastState ?: ""
-            } else {
-                orbBig?.text = if (connected) L("توقف", "Stop") else L("اتصال", "Connect")
-                orbSmall?.text = if (connected) L("متصل — ", "Connected — ") + sel.name else sel.name
-            }
-        }
-    }
-
-    // v1.1: status line only (the pill is gone).
-    // Connect errors NEVER appear here — not even
-    // «VPN permission denied»: they go to the app
-    // log only (refreshStatus logs the failure).
-    private fun renderStatus() {
-        val connecting = OvpnEngine.isConnecting
-        val connected = if (tab == "free") freeConnected() else openConnected()
-        val anyConnected = OvpnEngine.isConnected
-        val sl = statusLine ?: return
-        sl.setTextColor(OvpnTheme.subFg(this))
-        if (tab == "free") {
-            if (connected) {
-                // v1.5: country only when a real country is
-                // picked (same guard as the chip).
-                sl.text = if (TunnelBear.hasSelectedCountry(this))
-                    L("متصل به ", "Connected to ") + TunnelBear.displayCountry(TunnelBear.selectedCountry(this))
-                else L("متصل", "Connected")
-            } else if (connecting && OvpnEngine.activeName == TunnelBear.SINGLE_NAME) {
-                sl.text = L("در حال اتصال به «", "Connecting to “") + TunnelBear.DISPLAY_NAME + "»…"
-            } else if (anyConnected) {
-                sl.text = "«" + TunnelBear.displayNameForStored(OvpnEngine.activeName) + "» " + L("وصل است", "is connected")
-            } else if (!TunnelBear.hasAccount(this)) {
-                sl.text = L("برای ساخت اکانت رایگان فیلترشکن خود را روشن کنید", "Turn on your VPN to create a free account")
-            } else {
-                sl.text = L("حساب آماده است — کشور را از داخل دایره انتخاب کن", "Account ready — pick the country from inside the circle")
-            }
-        } else {
-            val sel = selectedProfileObj()
-            if (connected && sel != null) {
-                sl.text = L("متصل به پروفایل «", "Connected to profile “") + sel.name + "»"
-            } else if (connecting && sel != null && OvpnEngine.activeName == sel.name) {
-                sl.text = L("در حال اتصال به «", "Connecting to “") + sel.name + "»…"
-            } else if (anyConnected) {
-                sl.text = "«" + TunnelBear.displayNameForStored(OvpnEngine.activeName) + "» " + L("وصل است", "is connected")
-            } else if (sel == null) {
-                sl.text = if (ownProfiles().isEmpty())
-                    L("هنوز پروفایلی اضافه نشده است", "No profile yet")
-                else
-                    T("پروفایلی انتخاب نشده — روی یک پروفایل بزن", "No profile selected — tap a profile", "Профиль не выбран — нажмите на профиль")
-            } else {
-                sl.text = L("پروفایل «", "Profile “") + sel.name + L("» انتخاب شده — برای اتصال روی دایره بزن", "” selected — tap the circle to connect")
-            }
-        }
+    /** v1.12: cancel a running connect attempt (item 3) —
+     *  stop the ladder (the generation guard supersedes
+     *  it), stop the engine, clear the connecting state
+     *  and refresh the orb to idle. The pending log flag
+     *  is cleared too: a user cancel is not a failed
+     *  dial, so no failure line is written for it. */
+    private fun cancelCurrentConnect() {
+        retryGen.incrementAndGet()
+        retryLadderRunning = false
+        currentRungFa = null; currentRungEn = null; currentRungRu = null
+        try { OvpnEngine.disconnect() } catch (_: Exception) {}
+        appLogOvpnPending = false
+        refreshStatus(); refreshList()
     }
 
     // ---------- status + list ----------
@@ -1254,13 +1848,35 @@ class OpenVpnActivity : Activity() {
         if (ovpnNow && !appLogOvpnWasConnected) {
             if (appLogOvpnPending) {
                 val dispName = logDisplayName(OvpnEngine.activeName)
+                // v1.10: when a retry-ladder rung won, the line
+                // names the rung; otherwise it is a plain direct
+                // connect (free entry or first-rung win).
+                val wonFa = retryWonFa; val wonEn = retryWonEn; val wonRu = retryWonRu
+                retryWonFa = null; retryWonEn = null; retryWonRu = null
+                // v1.12: the free entry connects through the
+                // internal split relay (TCP 7011), not a plain
+                // direct dial — the old line said «اتصال
+                // مستقیم» for it (item 2). Plus the duration.
+                val howFa = if (wonFa != null) "روش «$wonFa»" else if (OvpnEngine.activeName == TunnelBear.SINGLE_NAME) "ریلی داخلی (TCP 7011)" else "اتصال مستقیم"
+                val howEn = if (wonEn != null) "method “$wonEn”" else if (OvpnEngine.activeName == TunnelBear.SINGLE_NAME) "internal relay (TCP 7011)" else "direct connect"
+                val howRu = if (wonRu != null) "способ «$wonRu»" else if (OvpnEngine.activeName == TunnelBear.SINGLE_NAME) "внутренний ретранслятор (TCP 7011)" else "прямое подключение"
+                val durSec = takeConnectDurationSec()
+                val durFa = if (durSec != null) "؛ مدت ${"%.1f".format(durSec)} ثانیه" else ""
+                val durEn = if (durSec != null) "; took ${"%.1f".format(durSec)} s" else ""
+                val durRu = if (durSec != null) "; заняло ${"%.1f".format(durSec)} с" else ""
                 AppLog.append(this, "openvpn",
-                    "«$dispName» وصل شد؛ اتصال مستقیم.",
-                    "“$dispName” connected; direct connect.",
-                    "«$dispName» подключён; прямое подключение.")
+                    "«$dispName» وصل شد؛ $howFa$durFa.",
+                    "“$dispName” connected; $howEn$durEn.",
+                    "«$dispName» подключён; $howRu$durRu.")
                 try { recordDial(OvpnEngine.activeName ?: "", true, null); refreshList() } catch (_: Exception) {}
                 appLogOvpnPending = false
             }
+            // v1.20: the first free-tunnel connection ends the
+            // tutorial for good — mark it HERE, at the exact
+            // moment the connect is observed (orb tap, SMART,
+            // auto-connect, failover all flow through this state
+            // observation), not up to 2s later via the poller.
+            try { if (OvpnEngine.activeName == TunnelBear.SINGLE_NAME) noteFirstFreeConnection() } catch (_: Exception) {}
         } else if (!ovpnNow && appLogOvpnWasConnected) {
             if (appLogOvpnLastName.isNotBlank()) {
                 AppLog.append(this, "openvpn",
@@ -1269,12 +1885,24 @@ class OpenVpnActivity : Activity() {
                     "«${logDisplayName(appLogOvpnLastName)}»; отключён.")
             }
         }
-        if (appLogOvpnPending && !ovpnNow && !OvpnEngine.isConnecting && OvpnEngine.lastError != null && OvpnEngine.lastError != appLogOvpnLastError) {
+        // v1.10: suppressed while the retry ladder runs — a failed
+        // rung must not log (or record a failed dial) while the
+        // next rung is still to try; the ladder logs exactly one
+        // failure line itself when every rung has failed.
+        if (appLogOvpnPending && !retryLadderRunning && !ovpnNow && !OvpnEngine.isConnecting && OvpnEngine.lastError != null && OvpnEngine.lastError != appLogOvpnLastError) {
             appLogOvpnLastError = OvpnEngine.lastError
+            // v1.12: method + last core stage + duration
+            // (item 2) — the old line had only the error.
+            val durSec = takeConnectDurationSec()
+            val durFa = if (durSec != null) "؛ مدت ${"%.1f".format(durSec)} ثانیه" else ""
+            val durEn = if (durSec != null) "; took ${"%.1f".format(durSec)} s" else ""
+            val durRu = if (durSec != null) "; заняло ${"%.1f".format(durSec)} с" else ""
+            val methFa = connectMethodFa(); val methEn = connectMethodEn(); val methRu = connectMethodRu()
+            val st = OvpnEngine.lastState ?: ""
             AppLog.append(this, "openvpn",
-                "«${logDisplayName(appLogOvpnPendingName)}» وصل نشد: ${OvpnEngine.lastError}.",
-                "“${logDisplayName(appLogOvpnPendingName)}” did not connect: ${OvpnEngine.lastError}.",
-                "«${logDisplayName(appLogOvpnPendingName)}» не подключился: ${OvpnEngine.lastError}.")
+                "«${logDisplayName(appLogOvpnPendingName)}» وصل نشد: ${OvpnEngine.lastError}؛ روش $methFa؛ مرحله «$st»$durFa.",
+                "“${logDisplayName(appLogOvpnPendingName)}” did not connect: ${OvpnEngine.lastError}; method $methEn; stage “$st”$durEn.",
+                "«${logDisplayName(appLogOvpnPendingName)}» не подключился: ${OvpnEngine.lastError}; способ $methRu; этап «$st»$durRu.")
             try { recordDial(appLogOvpnPendingName, false, OvpnEngine.lastError); refreshList() } catch (_: Exception) {}
             val failedName = appLogOvpnPendingName
             appLogOvpnPending = false
@@ -1282,6 +1910,8 @@ class OpenVpnActivity : Activity() {
             // failed to connect — try the backup
             // automatically, once per tap. A fresh backup
             // is created silently afterwards.
+            // v1.13: no failover during a sweep measurement
+            // (a failed measurement is not a failed user connect).
             if (failedName == TunnelBear.SINGLE_NAME && !freeFailoverTried) {
                 freeFailoverTried = true
                 tryFailoverToBackup()
@@ -1302,49 +1932,83 @@ class OpenVpnActivity : Activity() {
         } else {
             needDialogShownFor = null
         }
-        renderOrb()
-        renderStatus()
+        renderTopBox()
+        renderStatusLabel()
     }
 
     private fun refreshList() {
         val dark = OvpnTheme.isDark(this)
+        // v1.12: self-healing (item 4) — if the in-memory
+        // list lost the stored profiles (a failed render
+        // left it empty), reload from disk before rendering;
+        // the stored list is the truth, and a restart used
+        // to be the only way to get it back.
+        if (profiles.isEmpty()) {
+            try {
+                val stored = OvpnStore.load(this)
+                if (stored.isNotEmpty()) profiles = stored
+            } catch (_: Exception) {}
+        }
         // Drop health state of deleted profiles.
         try {
             val names = profiles.map { it.name }.toSet()
-            localDotViews.keys.retainAll(names)
-            remoteDotViews.keys.retainAll(names)
             localHealth.keys.retainAll(names)
         } catch (_: Exception) {}
-        // Country popup: rows are built once when opened;
-        // later refreshes only repaint the circles in
-        // place (never re-sort or rebuild while open).
-        if (tbCountryMenuOpen && countryPopup?.isShowing == true) {
-            for (c in tbCountryRowCircles.keys.toList()) refreshTbCountryRow(c)
-        }
         renderCards(dark)
+        renderTopBox()
     }
 
     private fun renderCards(dark: Boolean) {
         val container = cardsContainer ?: return
         container.removeAllViews()
+        // v1.12: one bad row must never blank the whole list
+        // (item 4) — a failing row is skipped, the rest
+        // render, and the mismatch is logged (once).
+        var rendered = 0
+        var renderFailed = 0
+        // 1.42 (A): the free entry is rendered by the
+        // dedicated top box, never as a normal row — the
+        // list below the box holds ONLY the user's own
+        // imported profiles (main app OpenVpnActivity
+        // :630-631: `if (p.tunnelBear) continue`).
         val own = ownProfiles()
-        emptyHint?.visibility = if (own.isEmpty()) View.VISIBLE else View.GONE
         val connected = OvpnEngine.isConnected || OvpnEngine.isConnecting
+        // 1.42 (F): the main app's circleBtn EXACTLY
+        // (config-renamer OpenVpnActivity.kt:609-628).
         fun circleBtn(glyph: String, sizeSp: Float, bold: Boolean, onClick: () -> Unit): TextView {
             return TextView(this).apply {
                 text = glyph
-                textSize = sizeSp
+                textSize = sizeSp * 0.7f
                 if (bold) setTypeface(null, android.graphics.Typeface.BOLD)
                 gravity = Gravity.CENTER
-                setTextColor(OvpnTheme.subFg(this@OpenVpnActivity))
-                setPadding(dp(8), dp(8), dp(8), dp(8))
+                setTextColor(Color.parseColor(if (dark) "#EDEFF5" else "#283593"))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                    setColor(if (dark) Theme.darken(Color.parseColor("#22FFFFFF")) else Color.parseColor("#F3EFFF"))
+                    setStroke((1 * resources.displayMetrics.density).toInt(),
+                        if (dark) Theme.darken(Color.parseColor("#88FFFFFF")) else Color.parseColor("#C5B8F0"))
+                }
+                val s = (36 * 0.7f * resources.displayMetrics.density).toInt()
+                layoutParams = LinearLayout.LayoutParams(s, s).apply {
+                    marginStart = (6 * 0.7f * resources.displayMetrics.density).toInt()
+                }
+                setPadding(0, 0, 0, 0)
                 setOnClickListener { onClick() }
             }
         }
-        for ((index, p) in profiles.withIndex()) {
-            // The free entry never renders as a normal row —
-            // it lives on the Free tab's orb.
+        // 1.42 (G): pinned-first, then alphabetical by
+        // name (v1.26 sort, sorted at render). The loop
+        // runs over the sorted display list; edit /
+        // diagnosis / delete still take the index in
+        // the stored `profiles` list.
+        val sorted = own.sortedWith(
+            compareByDescending<OvpnProfile> { TunnelBear.isPinned(this, it.name) }
+                .thenBy { it.name.lowercase() })
+        for (p in sorted) {
+            // 1.42 (A): the free entry is rendered by the dedicated box above, never as a normal row.
             if (p.tunnelBear) continue
+            val index = profiles.indexOf(p)
+            try {
             val isActive = connected && OvpnEngine.activeName == p.name
             val isSel = selectedProfileObj()?.name == p.name
             val row = LinearLayout(this).apply {
@@ -1358,11 +2022,11 @@ class OpenVpnActivity : Activity() {
                 // light green (tap a card to select it,
                 // then the orb connects it). No toggle.
                 if (dark) {
-                    setColor(if (isSel) Color.parseColor("#CC1E3A2F")
-                        else if (isActive) Color.parseColor("#B32A3D5C") else Color.parseColor("#D2121A34"))
+                    setColor(if (isSel) Theme.darken(Color.parseColor("#CC1E3A2F"))
+                        else if (isActive) Theme.darken(Color.parseColor("#B32A3D5C")) else Theme.darken(Color.parseColor("#D2121A34")))
                     setStroke(((if (isSel) 1.5f else 1f) * resources.displayMetrics.density).toInt(),
                         if (isSel) OvpnTheme.accent(this@OpenVpnActivity)
-                        else if (isActive) Color.parseColor("#26A69A") else Color.parseColor("#592DD4BF"))
+                        else if (isActive) Color.parseColor("#26A69A") else Theme.darken(Color.parseColor("#592DD4BF")))
                 } else {
                     setColor(if (isSel) Color.parseColor("#DFF3E4")
                         else if (isActive) Color.parseColor("#E8EEF7") else Color.parseColor("#E0FFFFFF"))
@@ -1378,54 +2042,92 @@ class OpenVpnActivity : Activity() {
                     LinearLayout.LayoutParams.WRAP_CONTENT
                 ).apply { setMargins(dp(20), dp(5), dp(20), dp(5)) }
                 setOnClickListener {
+                    // v1.12: auto-connect on switch (item 6) —
+                    // tapping another card while a tunnel is up
+                    // disconnects the current one and connects
+                    // the newly selected profile.
+                    val wasConnected = OvpnEngine.isConnected
+                    val wasActive = OvpnEngine.activeName
                     selectedProfile = p.name
                     try {
                         getSharedPreferences("renamer_ovpn", MODE_PRIVATE).edit().putString("ovpn_last", p.name).apply()
                     } catch (_: Exception) {}
+                    if (wasConnected && wasActive != null && wasActive != p.name) {
+                        connectProfile(p, fromSwitch = true)
+                    }
                     renderCards(OvpnTheme.isDark(this@OpenVpnActivity))
-                    renderOrb()
-                    renderStatus()
+                    renderTopBox()
+                    renderStatusLabel()
                 }
             }
-            // Two health dots, stacked (3.07 session probe).
-            val trulyConnected = OvpnEngine.isConnected && OvpnEngine.activeName == p.name
-            val dotsCol = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                    marginEnd = dp(10)
+            // 1.41 (E): the connect toggle — FIRST child
+            // (leftmost, like the main app). The SAME
+            // themed pill toggle (62×41 bitmap at 0.7,
+            // 48×32 layout at 0.7); the ladder state
+            // keeps its amber busy bitmap. It triggers
+            // the same connect path the orb used.
+            val isBusy = OvpnEngine.isConnecting && OvpnEngine.activeName == p.name
+            val toggle = android.widget.ImageView(this).apply {
+                setImageBitmap(if (isBusy) HydraUi.toggleBitmapBusy(this@OpenVpnActivity)
+                    else if (dark) Theme.pillToggleBitmap(this@OpenVpnActivity, (62 * 0.7f).toInt(), (41 * 0.7f).toInt(), isActive,
+                        "#8B9098", "#9AA0B0", "#1B746C", "#B2DFDB")
+                    else Theme.pillToggleBitmap(this@OpenVpnActivity, (62 * 0.7f).toInt(), (41 * 0.7f).toInt(), isActive,
+                        "#FFF3D6", "#FFFFFF", "#C8E6C9", "#81C784"))
+                val dd = resources.displayMetrics.density
+                layoutParams = LinearLayout.LayoutParams((48 * 0.7f * dd).toInt(), (32 * 0.7f * dd).toInt()).apply {
+                    setMargins(0, 0, (8 * 0.7f * dd).toInt(), 0)
+                }
+                setOnClickListener {
+                    if (isBusy) {
+                        // 2.41: re-tapping the profile its
+                        // own ladder is working on CANCELS
+                        // it — it used to restart the
+                        // ladder, so rapid re-taps could
+                        // never let one finish.
+                        cancelCurrentConnect()
+                    } else if (isActive) {
+                        // v1.10: a user stop aborts any
+                        // running retry ladder, so it can
+                        // never reconnect behind it.
+                        retryGen.incrementAndGet()
+                        OvpnEngine.disconnect()
+                        refreshStatus(); refreshList()
+                    } else {
+                        connectProfile(p)
+                    }
                 }
             }
-            val upperDot = View(this).apply {
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.OVAL
-                    setColor(if (trulyConnected) Color.parseColor("#43A047") else dotColor(probeDots(p.name).first))
+            row.addView(toggle)
+            // 1.42 (G): the v1.26 pin between the toggle
+            // and the name — filled #2E9E6B when pinned,
+            // faint grey #9E9E9E outline when not.
+            // Tapping it toggles the pin ONLY: no
+            // selection change, no connect.
+            val pinned = TunnelBear.isPinned(this@OpenVpnActivity, p.name)
+            row.addView(android.widget.ImageView(this).apply {
+                setImageBitmap(OvpnTheme.pinBitmap(this@OpenVpnActivity,
+                    if (pinned) "#2E9E6B" else "#9E9E9E", 16, pinned))
+                layoutParams = LinearLayout.LayoutParams(dp(16), dp(16)).apply {
+                    marginEnd = dp(6)
                 }
-                layoutParams = LinearLayout.LayoutParams(dp(9), dp(9))
-            }
-            val lowerDot = View(this).apply {
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.OVAL
-                    setColor(if (trulyConnected) Color.parseColor("#43A047") else dotColor(probeDots(p.name).second))
+                isClickable = true
+                setOnClickListener {
+                    try {
+                        TunnelBear.setPinned(this@OpenVpnActivity, p.name,
+                            !TunnelBear.isPinned(this@OpenVpnActivity, p.name))
+                    } catch (_: Exception) {}
+                    renderCards(OvpnTheme.isDark(this@OpenVpnActivity))
                 }
-                layoutParams = LinearLayout.LayoutParams(dp(9), dp(9)).apply {
-                    topMargin = dp(4)
-                }
-            }
-            dotsCol.addView(upperDot)
-            dotsCol.addView(lowerDot)
-            localDotViews[p.name] = upperDot
-            remoteDotViews[p.name] = lowerDot
-            dotsCol.setOnClickListener { showDotInfo(p.name) }
-            row.addView(dotsCol)
+            })
             val info = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
             info.addView(TextView(this).apply {
-                text = L("پروفایل OpenVPN", "OpenVPN Profile")
+                // 1.41 (E): the label is "OpenVPN Profile"
+                // in English, exactly as in the main app's
+                // Profiles page (screenshot 3).
+                text = "OpenVPN Profile"
                 textSize = 12f
                 setTextColor(OvpnTheme.subFg(this@OpenVpnActivity))
                 textDirection = View.TEXT_DIRECTION_LTR
@@ -1440,300 +2142,105 @@ class OpenVpnActivity : Activity() {
                 gravity = Gravity.START
                 maxLines = 1
                 ellipsize = android.text.TextUtils.TruncateAt.END
-                setOnClickListener { showNamePopup(row, p.name) }
+                // v1.12: no tap handler here (item 7) — the
+                // whole card selects; only ✎ opens edit.
             })
-            info.setOnClickListener { editProfile(index) }
+            // v1.12: the info column no longer opens edit
+            // (item 7) — only the ✎ icon does.
             row.addView(info)
-            row.addView(circleBtn("ⓘ", 15f, false) { showDiagnosis(index) })
-            row.addView(circleBtn("✎", 15f, false) { editProfile(index) })
-            row.addView(TextView(this).apply {
-                text = "✕"
-                textSize = 15f
-                setTypeface(null, android.graphics.Typeface.BOLD)
-                setTextColor(Color.parseColor("#E5484D"))
-                gravity = Gravity.CENTER
-                setPadding(dp(8), dp(8), dp(8), dp(8))
+            row.addView(circleBtn("i", 16f, true) { showDiagnosis(index) })
+            row.addView(circleBtn("✎", 18f, false) { editProfile(index) })
+            // 1.42 (F): delete = the main app's drawn trash
+            // glyph in the pink oval (not the red ✕ text).
+            row.addView(android.widget.ImageView(this).apply {
+                setImageBitmap(Theme.trashGlyphBitmap(this@OpenVpnActivity,
+                    if (dark) "#F48FB1" else "#D32F2F", (20 * 0.7f).toInt()))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                    setColor(if (dark) Theme.darken(Color.parseColor("#33FCE4EC")) else Color.parseColor("#FCE4EC"))
+                    setStroke((1 * resources.displayMetrics.density).toInt(),
+                        Color.parseColor(if (dark) "#F48FB1" else "#F8BBD0"))
+                }
+                val s = (36 * 0.7f * resources.displayMetrics.density).toInt()
+                layoutParams = LinearLayout.LayoutParams(s, s).apply {
+                    marginStart = (6 * 0.7f * resources.displayMetrics.density).toInt()
+                }
+                val pad = (8 * 0.7f * resources.displayMetrics.density).toInt()
+                setPadding(pad, pad, pad, pad)
                 setOnClickListener { confirmDelete(index) }
             })
             container.addView(row)
+                rendered++
+            } catch (_: Exception) { renderFailed++ }
         }
-    }
-
-    // ---------- country popup (Free tab, anchored to the chip) ----------
-    // v1.1: a NARROW floating card just below the chip —
-    // not full-screen, not a bottom sheet — scrollable,
-    // flags + health circles per country, checkmark on
-    // the selected one. Tapping a country selects it
-    // and closes the popup.
-    private fun toggleCountryPanel() {
-        if (countryPopup?.isShowing == true) {
-            try { countryPopup?.dismiss() } catch (_: Exception) {}
-            countryPopup = null
-            tbCountryMenuOpen = false
-            return
-        }
-        showCountryPopup()
-    }
-
-    private fun showCountryPopup() {
-        val anchor = countryChip ?: return
-        val dark = OvpnTheme.isDark(this)
-        tbCountryRowCircles.clear()
-        val panel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = OvpnTheme.glassCard(this@OpenVpnActivity, 18f)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-        panel.addView(TextView(this).apply {
-            text = L("انتخاب کشور — ۴۷ کشور با پرچم", "Choose country — 47 countries with flags")
-            textSize = 12f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setTextColor(OvpnTheme.subFg(this@OpenVpnActivity))
-            textDirection = appTextDir()
-            gravity = Gravity.START
-            setPadding(dp(15), dp(11), dp(15), dp(5))
-        })
-        // Sorted ONCE at open from the probe cache + real-dial
-        // outcomes (2-green first, then 1-green, then green+red,
-        // then red); live probe results update the circles IN
-        // PLACE and never re-sort while the list is open.
-        val countries = sortedTbCountries()
-        val country = TunnelBear.selectedCountry(this)
-        // v1.5: a row is marked selected only when a real
-        // country was picked (same guard as the chip) —
-        // the unpicked default must not checkmark any row.
-        val hasPick = TunnelBear.hasSelectedCountry(this)
-        val menuList = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutDirection = rtlDir()
-        }
-        for (c in countries) {
-            val isSel = hasPick && c.equals(country, ignoreCase = true)
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                layoutDirection = rtlDir()
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT)
-                isClickable = true
+        // v1.12: post-render count check (item 4) — if the
+        // rows on screen do not match the stored profiles,
+        // say so in the log (once per distinct mismatch) so
+        // the empty-list bug can be followed up from the log.
+        try {
+            val sig = "${own.size}|$rendered|$renderFailed"
+            if ((rendered != own.size || renderFailed > 0) && sig != lastListMismatchSig) {
+                lastListMismatchSig = sig
+                AppLog.append(this, "openvpn",
+                    "لیست پروفایل‌ها ناقص رندر شد: ${own.size} پروفایل، $rendered ردیف، $renderFailed خطا.",
+                    "Profile list rendered incompletely: ${own.size} profiles, $rendered rows, $renderFailed errors.",
+                    "Список профилей отрисован не полностью: профилей ${own.size}, строк $rendered, ошибок $renderFailed.")
             }
-            row.addView(TextView(this).apply {
-                text = if (isSel) "✓ ${TunnelBear.displayCountry(c)}" else TunnelBear.displayCountry(c)
-                textSize = 13.5f
-                if (isSel) setTypeface(null, android.graphics.Typeface.BOLD)
-                setTextColor(if (isSel) Color.parseColor("#2E9E6B") else OvpnTheme.fg(this@OpenVpnActivity))
-                textDirection = View.TEXT_DIRECTION_LTR
-                gravity = Gravity.START
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                setPadding(dp(15), dp(10), dp(4), dp(10))
-            })
-            val circles = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                layoutDirection = View.LAYOUT_DIRECTION_LTR
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                    marginStart = dp(16)
-                    marginEnd = dp(15)
-                }
-            }
-            tbCountryRowCircles[c] = circles
-            row.addView(circles)
-            refreshTbCountryRow(c)
-            row.setOnClickListener {
-                try {
-                    TunnelBear.saveSelectedCountry(this@OpenVpnActivity, c)
-                    TunnelBear.ensureSingleEntry(this@OpenVpnActivity)
-                    profiles = OvpnStore.load(this@OpenVpnActivity)
-                } catch (_: Exception) {}
-                // v1.3: probe the picked country NOW (priority,
-                // ahead of the menu sweep) so its dot shows the
-                // fresh result right away.
-                probeCountryNow(c)
-                try { countryPopup?.dismiss() } catch (_: Exception) {}
-                countryPopup = null
-                tbCountryMenuOpen = false
-                refreshList()
-                refreshStatus()
-            }
-            menuList.addView(row)
-        }
-        startTbCountryProbe(forceFresh = true)
-        // Fixed-height scroll: ~5 rows visible, all 47
-        // reachable.
-        panel.addView(ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(280))
-            isVerticalScrollBarEnabled = true
-            addView(menuList)
-        })
-        val pw = android.widget.PopupWindow(panel, dp(240),
-            android.view.WindowManager.LayoutParams.WRAP_CONTENT, true)
-        pw.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
-        pw.isOutsideTouchable = true
-        // Centre the narrow popup under the chip.
-        val xOff = (anchor.width - dp(240)) / 2
-        pw.showAsDropDown(anchor, xOff, dp(8))
-        pw.setOnDismissListener {
-            tbCountryMenuOpen = false
-            countryPopup = null
-        }
-        countryPopup = pw
-        tbCountryMenuOpen = true
+        } catch (_: Exception) {}
     }
 
-    /** Sort tier for one country — SAME order as
-     *  refreshTbCountryRow, so the sort agrees with the
-     *  dots: 0 = full session proven OR TLS healthy +
-     *  recent successful real dial, 1 = TLS healthy,
-     *  2 = TLS healthy but session/dial failed,
-     *  3 = TLS not healthy. A TLS-only session result
-     *  never hides a recent successful real dial.
-     *  Alphabetical inside a tier. */
-    private fun tbCountryTier(c: String): Int {
-        val host = tbCountryHosts.getOrPut(c) { TunnelBear.remoteHostForCountry(this, c) ?: "" }
-        val session = if (host.isBlank()) null else TunnelBear.cachedSession(this, host)
-        val probe = if (host.isBlank()) null else TunnelBear.cachedProbe(this, host)
-        val dial = TunnelBear.dialOutcome(this, c)
-        val tlsHealthy = (session != null && session.tls == 2) || probe == 2
-        return when {
-            session != null && session.tls == 2 && session.session == 1 -> 0
-            tlsHealthy && dial == 1 -> 0
-            session != null && session.tls == 2 && session.session == -1 -> 2
-            tlsHealthy && dial == -1 -> 2
-            tlsHealthy -> 1
-            else -> 3
-        }
+    // ---------- v1.13: Smart Connect ----------
+
+    /** 1.42 (G): v1.26 Smart pick restored — the first
+     *  pinned entry (alphabetical) that is a known
+     *  country, else the default country (Germany).
+     *  Pins are keyed by profile name (see renderCards). */
+    private fun pickSmartCountry(): String {
+        return TunnelBear.pinnedCountries(this)
+            .sortedBy { it.lowercase() }
+            .firstOrNull { TunnelBear.isKnownCountry(this, it) }
+            ?: TunnelBear.DEFAULT_COUNTRY
     }
 
-    private fun sortedTbCountries(): List<String> {
-        return TunnelBear.countries(this)
-            .sortedWith(compareBy({ tbCountryTier(it) }, { it }))
+
+    /** v1.26: Smart Connect — no testing anymore. The
+     *  pick is the first pinned country, else the
+     *  default country; connecting is the normal orb
+     *  connect (full ladder for the free entry). */
+    private fun smartConnect() {
+        connectSmartCountry(pickSmartCountry())
     }
 
-    /** Paints one row's circles IN PLACE (never re-sorts
-     *  the open list). Green = server TLS-healthy; second
-     *  green = full session proven (AUTH + PUSH_REPLY with
-     *  an assigned IP) OR a recent successful REAL DIAL;
-     *  green + red = TLS healthy but the session failed
-     *  OR a recent real dial failed; red = TLS not healthy;
-     *  grey hollow = still testing / unknown. A TLS-only
-     *  session result NEVER hides a recent successful
-     *  real dial — the old order returned one green on
-     *  session=(2,0) before ever reaching the dial branch. */
-    private fun refreshTbCountryRow(country: String) {
-        val circles = tbCountryRowCircles[country] ?: return
-        val host = tbCountryHosts.getOrPut(country) { TunnelBear.remoteHostForCountry(this, country) ?: "" }
-        val session = if (host.isBlank()) null else TunnelBear.cachedSession(this, host)
-        val probe = if (host.isBlank()) null else TunnelBear.cachedProbe(this, host)
-        val dial = TunnelBear.dialOutcome(this, country)
-        fun dot(color: Int?, hollow: Boolean) {
-            val v = View(this).apply {
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.OVAL
-                    if (hollow) {
-                        setColor(Color.TRANSPARENT)
-                        setStroke(dp(1), Color.parseColor("#9E9E9E"))
-                    } else {
-                        setColor(color ?: Color.parseColor("#9E9E9E"))
-                    }
-                }
-                layoutParams = LinearLayout.LayoutParams(dp(9), dp(9)).apply {
-                    marginStart = dp(2)
-                    marginEnd = dp(2)
-                }
-            }
-            circles.addView(v)
-        }
-        circles.removeAllViews()
-        val green = Color.parseColor("#43A047")
-        val red = Color.parseColor("#D32F2F")
-        // v1.3: the dial outcome promotes/demotes the
-        // second dot whenever TLS is healthy. Order matters:
-        // a full session proof wins first; a TLS-only session
-        // result never hides a recent successful real dial.
-        val tlsHealthy = (session != null && session.tls == 2) || probe == 2
-        when {
-            session != null && session.tls == 2 && session.session == 1 -> { dot(green, false); dot(green, false) }
-            tlsHealthy && dial == 1 -> { dot(green, false); dot(green, false) }
-            session != null && session.tls == 2 && session.session == -1 -> { dot(green, false); dot(red, false) }
-            tlsHealthy && dial == -1 -> { dot(green, false); dot(red, false) }
-            tlsHealthy -> dot(green, false)
-            session != null || probe != null -> dot(red, false)
-            else -> dot(null, true)
-        }
+    /** Connect to the country Smart Connect picked — it
+     *  becomes the active location (chip, log and the dial
+     *  outcome are recorded for THAT country). */
+    private fun connectSmartCountry(country: String) {
+        try { TunnelBear.saveSmartChoice(this, country) } catch (_: Exception) {}
+        try {
+            TunnelBear.ensureSingleEntry(this)
+            profiles = OvpnStore.load(this)
+        } catch (_: Exception) {}
+        val p = tbProfile() ?: return
+        connectProfile(p)
     }
 
-    /** v1.3: fresh re-test of the listed countries on a
-     *  bounded 8-thread pool — the SESSION probe (TLS +
-     *  AUTH + PUSH), not just the TLS flight; each result
-     *  is cached (10 min TTL) and its row's circles are
-     *  updated live. Called on EVERY menu open with
-     *  forceFresh = true: countries with a fresh cached
-     *  verdict are re-probed anyway, so the dots show
-     *  whether each config connects on this internet
-     *  RIGHT NOW — never just the stale cache. The
-     *  10-min cache still governs the background
-     *  (page-entry) sweep. Skipped entirely while a VPN
-     *  is up (a probe through a live tunnel measures the
-     *  tunnel exit, not this line) and when no free
-     *  account exists yet (nothing to test — dots stay
-     *  grey hollow). Plain sockets only — never touches
-     *  the VPN. */
-    private fun startTbCountryProbe(forceFresh: Boolean = false) {
-        if (TunnelBear.getAccount(this) == null) return
-        if (anyVpnUp()) return
-        val gen = ++tbCountryProbeGen
-        try { tbCountryProbePool?.shutdownNow() } catch (_: Exception) {}
-        val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
-        tbCountryProbePool = pool
-        for (c in tbCountryRowCircles.keys.toList()) {
-            val host = tbCountryHosts[c] ?: continue
-            if (host.isBlank()) continue
-            if (!forceFresh && TunnelBear.cachedSession(this, host) != null) continue
-            pool.submit {
-                try {
-                    TunnelBear.probeCountrySession(this@OpenVpnActivity, host)
-                    handler.post {
-                        if (gen == tbCountryProbeGen && tbCountryMenuOpen) refreshTbCountryRow(c)
-                    }
-                } catch (_: Exception) {}
-            }
-        }
-    }
 
-    /** v1.3: priority probe for the country the user just
-     *  picked in the menu — runs immediately on its own
-     *  thread, ahead of the menu sweep, so the fresh
-     *  result is in the cache right away (the next menu
-     *  open shows its dots instantly). Skipped with no
-     *  account or while a VPN is up. */
-    private fun probeCountryNow(country: String) {
-        if (TunnelBear.getAccount(this) == null) return
-        if (anyVpnUp()) return
-        val host = tbCountryHosts[country]
-            ?: TunnelBear.remoteHostForCountry(this, country) ?: return
-        if (host.isBlank()) return
-        Thread {
-            try {
-                TunnelBear.probeCountrySession(this@OpenVpnActivity, host)
-                handler.post {
-                    if (tbCountryMenuOpen) refreshTbCountryRow(country)
-                }
-            } catch (_: Exception) {}
-        }.start()
-    }
+
 
     // ---------- connect ----------
-    private fun connectProfile(p: OvpnProfile) {
+    private fun connectProfile(p: OvpnProfile, fromSwitch: Boolean = false, maxRungs: Int = Int.MAX_VALUE, forceLadder: Boolean = false): Int {
+        // v1.10: a fresh tap supersedes any running retry
+        // ladder for another profile.
+        retryGen.incrementAndGet()
         // v1.1: a fresh user tap is a fresh failover
         // allowance (one backup try per tap).
         if (TunnelBear.isTunnelBear(p)) freeFailoverTried = false
+        // 1.71 (item 3): remember which country THIS free
+        // attempt is for — noteFirstFreeConnection records
+        // it only when the tunnel actually reaches
+        // CONNECTED, so a failed/cancelled attempt never
+        // becomes the "last-connected" location.
+        if (TunnelBear.isTunnelBear(p)) connectingFreeCountry = TunnelBear.selectedCountry(this)
         // The free entry needs the user's own account. With one
         // saved, its credentials fill the profile (in memory
         // only — the stored profile keeps blank credentials);
@@ -1747,7 +2254,7 @@ class OpenVpnActivity : Activity() {
                 // the 3-second message when no VPN is on, else
                 // the waiting screen).
                 startTbAutoCreation()
-                return
+                return -1
             }
             if (p.username.isBlank()) p.username = acc.first
             if (p.password.isBlank()) p.password = acc.second
@@ -1759,6 +2266,18 @@ class OpenVpnActivity : Activity() {
         // openvpn start, then wait forever for input (NEED
         // state) while the UI just showed CONNECTING.
         if (p.needsAuth() && (p.username.isBlank() || p.password.isBlank()) && !p.hasEmbeddedCredentials()) {
+            // v1.12: a card-switch (item 7) never pops the
+            // username/password page — just select the profile
+            // and tell the user to fill the credentials via
+            // the ✎ edit icon, keeping the current tunnel up.
+            if (fromSwitch) {
+                android.widget.Toast.makeText(this,
+                    T("برای اتصال به «${p.name}»، اول نام کاربری و رمز را از دکمه ویرایش ✎ وارد کن",
+                        "To connect to “${p.name}”, first fill in the username and password via the ✎ edit button",
+                        "Чтобы подключиться к «${p.name}», сначала введите имя пользователя и пароль через кнопку редактирования ✎"),
+                    android.widget.Toast.LENGTH_LONG).show()
+                return -1
+            }
             val userInput = EditText(this).apply {
                 hint = L("نام کاربری", "Username")
                 setText(p.username)
@@ -1787,21 +2306,213 @@ class OpenVpnActivity : Activity() {
                 }
                 .setNegativeButton(L("لغو", "Cancel")) { _, _ -> refreshList() }
                 .show().also { OvpnTheme.styleDialog(it, this) }
-            return
+            return -1
         }
-        connectDirect(p)
+        return connectDirect(p, maxRungs, forceLadder)
     }
 
-    /** One DIRECT ovpn3 connect. No engine ladder, no chain:
-     *  this app has no Smart engine, so OFF = the only mode. */
-    private fun connectDirect(p: OvpnProfile) {
+    /** v1.12: the connect duration for the log (item 2) —
+     *  seconds with one decimal, from the attempt start
+     *  (set in connectDirect). Consumes the start time:
+     *  the first caller gets the duration, later callers
+     *  get null. */
+    private fun takeConnectDurationSec(): Double? {
+        if (connectAttemptStartMs <= 0) return null
+        val s = (System.currentTimeMillis() - connectAttemptStartMs) / 1000.0
+        connectAttemptStartMs = 0
+        return s
+    }
+
+    /** v1.12: the method string for the failure log (item
+     *  2) — the rung running when it failed, else the
+     *  free relay, else a plain direct connect. */
+    private fun connectMethodFa(): String = when {
+        currentRungFa != null -> "«$currentRungFa»"
+        appLogOvpnPendingName == TunnelBear.SINGLE_NAME -> "ریلی داخلی (TCP 7011)"
+        else -> "اتصال مستقیم"
+    }
+    private fun connectMethodEn(): String = when {
+        currentRungEn != null -> "“$currentRungEn”"
+        appLogOvpnPendingName == TunnelBear.SINGLE_NAME -> "internal relay (TCP 7011)"
+        else -> "direct connect"
+    }
+    private fun connectMethodRu(): String = when {
+        currentRungRu != null -> "«$currentRungRu»"
+        appLogOvpnPendingName == TunnelBear.SINGLE_NAME -> "внутренний ретранслятор (TCP 7011)"
+        else -> "прямое подключение"
+    }
+
+    /** Direct connect for the free entry; the retry ladder for
+     *  imported profiles (v1.10 — see OvpnRetry): the original
+     *  config first, then direct-IP, DoH-IP, proto-swap and
+     *  mssfix rungs until one holds. The saved profile is never
+     *  rewritten; rungs run on in-memory copies. */
+    private fun connectDirect(p: OvpnProfile, maxRungs: Int = Int.MAX_VALUE, forceLadder: Boolean = false): Int {
+        // v1.12: the method in the attempt line (item 2) —
+        // the free entry uses the internal relay, imported
+        // profiles use the retry ladder.
+        val methodFa = if (TunnelBear.isTunnelBear(p)) "ریلی داخلی" else "نردبان روش‌ها"
+        val methodEn = if (TunnelBear.isTunnelBear(p)) "internal relay" else "method ladder"
+        val methodRu = if (TunnelBear.isTunnelBear(p)) "внутренний ретранслятор" else "лестница способов"
+        // Every connect through here is a user connect —
+        // log the attempt and arm the pending-connect log.
         AppLog.append(this, "openvpn",
-            "تلاش اتصال «${logDisplayName(p.name)}»؛ اتصال مستقیم.",
-            "Connect attempt “${logDisplayName(p.name)}”; direct connect.",
-            "Попытка подключения «${logDisplayName(p.name)}»; прямое подключение.")
+            "تلاش اتصال «${logDisplayName(p.name)}»؛ $methodFa.",
+            "Connect attempt “${logDisplayName(p.name)}”; $methodEn.",
+            "Попытка подключения «${logDisplayName(p.name)}»; $methodRu.")
         appLogOvpnPending = true
         appLogOvpnPendingName = p.name
-        OvpnEngine.connect(this, p) { runOnUiThread { refreshStatus(); refreshList() } }
+        // v1.12: the attempt starts NOW (item 2 — duration
+        // for the log; item 3 — the orb shows the connecting
+        // state immediately, before the ladder thread even
+        // starts, instead of looking idle while the rung
+        // list is built and the endpoint is probed).
+        connectAttemptStartMs = System.currentTimeMillis()
+        OvpnEngine.isConnecting = true
+        OvpnEngine.activeName = p.name
+        OvpnEngine.lastError = null
+        refreshStatus(); refreshList()
+        if (TunnelBear.isTunnelBear(p) && !forceLadder) {
+            OvpnEngine.connect(this, p) { runOnUiThread { refreshStatus(); refreshList() } }
+            return -1
+        }
+        val myGen = retryGen.get()
+        retryLadderRunning = true
+        ladderStartedAnyRung = false
+        Thread {
+            try {
+                runRetryLadder(p, myGen)
+            } catch (_: Exception) {
+            } finally {
+                retryLadderRunning = false
+                // v1.12: if the ladder exited without starting
+                // any rung (or was superseded before the first
+                // rung), clear the connecting state the instant
+                // set above — otherwise the orb would sit on
+                // «در حال اتصال» with nothing running. The
+                // generation check keeps a newer attempt's
+                // state untouched.
+                if (!ladderStartedAnyRung && retryGen.get() == myGen) {
+                    OvpnEngine.isConnecting = false
+                    OvpnEngine.activeName = null
+                }
+                runOnUiThread { try { refreshStatus(); refreshList() } catch (_: Exception) {} }
+            }
+        }.apply { isDaemon = true }.start()
+        return myGen
+    }
+
+    /** The ladder itself (background thread). Aborts when a newer
+     *  connect supersedes it (retryGen) or the user stops it. */
+    private fun runRetryLadder(p: OvpnProfile, myGen: Int, maxRungs: Int = Int.MAX_VALUE) {
+        fun aborted(): Boolean = retryGen.get() != myGen
+        val rungs = try { OvpnRetry.buildRungs(p.ovpn) } catch (_: Exception) {
+            listOf(OvpnRetry.Rung("original", "اصلی", "Original", "Оригинал", p.ovpn))
+        }
+        for (rung in rungs.take(maxRungs)) {
+            if (aborted()) return
+            // v1.12: the rung now running, for the log (item 2).
+            currentRungFa = rung.nameFa; currentRungEn = rung.nameEn; currentRungRu = rung.nameRu
+            // Fast probe: a dead TCP endpoint is skipped at once
+            // (its TLS handshake cannot succeed); a silent UDP
+            // endpoint still runs, with a shorter budget.
+            val ep = try { OvpnRetry.firstEndpoint(rung.text) } catch (_: Exception) { null }
+            var timeoutMs = 40000L
+            if (ep != null) {
+                val res = try { OvpnRetry.probeEndpoint(ep) } catch (_: Exception) { 2 }
+                when (res) {
+                    -1, 1 -> { currentRungFa = null; currentRungEn = null; currentRungRu = null; continue }
+                    2 -> timeoutMs = 25000L
+                }
+            }
+            // v1.12: settle the previous core BEFORE starting
+            // a new one (item 3 — the stale-core race).
+            // disconnect() only SIGNALS the old core to stop;
+            // its thread stays alive in native c.connect()
+            // long after isConnecting=false, and its late
+            // events used to reset the NEW rung's state
+            // mid-rung. Wait for the thread to actually exit
+            // (bounded 10s); if it will not, abort the ladder
+            // instead of starting a second core over it.
+            try { OvpnEngine.disconnect() } catch (_: Exception) {}
+            val settled = try { Ovpn3VpnService.awaitClientExit(10_000) } catch (_: Exception) { true }
+            if (!settled) {
+                AppLog.append(this, "openvpn",
+                    "«${logDisplayName(p.name)}» وصل نشد: هسته‌ی قبلی خاموش نشد و روش «${rung.nameFa}» شروع نشد.",
+                    "“${logDisplayName(p.name)}” did not connect: the previous core did not stop, so method “${rung.nameEn}” never started.",
+                    "«${logDisplayName(p.name)}» не подключился: предыдущее ядро не остановилось, поэтому способ «${rung.nameRu}» не запустился.")
+                appLogOvpnPending = false
+                OvpnEngine.isConnecting = false
+                OvpnEngine.isConnected = false
+                return
+            }
+            ladderStartedAnyRung = true
+            val rungProfile = p.copy(ovpn = rung.text)
+            val started = java.util.concurrent.CountDownLatch(1)
+            runOnUiThread {
+                try { OvpnEngine.connect(this@OpenVpnActivity, rungProfile) {} } catch (_: Exception) {} finally { started.countDown() }
+            }
+            try { started.await(5, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
+            if (aborted()) return
+            runOnUiThread { try { refreshStatus(); refreshList() } catch (_: Exception) {} }
+            when (OvpnRetry.waitRung(p.name, timeoutMs) { aborted() }) {
+                0 -> {
+                    // Connected — but it must HOLD 3s.
+                    retryWonFa = rung.nameFa; retryWonEn = rung.nameEn; retryWonRu = rung.nameRu
+                    val holdEnd = System.currentTimeMillis() + 3000
+                    var stable = true
+                    while (System.currentTimeMillis() < holdEnd) {
+                        if (aborted()) return
+                        if (!OvpnEngine.isConnected || OvpnEngine.activeName != p.name) { stable = false; break }
+                        try { Thread.sleep(200) } catch (_: Exception) {}
+                    }
+                    if (!stable) {
+                        retryWonFa = null; retryWonEn = null; retryWonRu = null
+                        try { OvpnEngine.disconnect() } catch (_: Exception) {}
+                        try { Thread.sleep(800) } catch (_: Exception) {}
+                        continue
+                    }
+                    // Held: the poller's success branch logs it
+                    // (with the rung name, from retryWon*).
+                    return
+                }
+                1, 2 -> {
+                    // v1.12: one line per failed rung (item 2) —
+                    // the method, the stage and the reason, so
+                    // the log alone shows which rungs were tried
+                    // and why each died.
+                    AppLog.append(this, "openvpn",
+                        "روش «${rung.nameFa}» برای «${logDisplayName(p.name)}» جواب نداد: ${OvpnEngine.lastError ?: OvpnEngine.lastState ?: "—"}.",
+                        "Method “${rung.nameEn}” for “${logDisplayName(p.name)}” did not work: ${OvpnEngine.lastError ?: OvpnEngine.lastState ?: "—"}.",
+                        "Способ «${rung.nameRu}» для «${logDisplayName(p.name)}» не сработал: ${OvpnEngine.lastError ?: OvpnEngine.lastState ?: "—"}.")
+                    try { OvpnEngine.disconnect() } catch (_: Exception) {}
+                    try { Thread.sleep(800) } catch (_: Exception) {}
+                    continue
+                }
+                else -> return // aborted
+            }
+        }
+        // No rung connected: ONE failure line (the poller's
+        // failure branch is suppressed while the ladder runs,
+        // so this is the only one).
+        if (aborted()) return
+        retryWonFa = null; retryWonEn = null; retryWonRu = null
+        val err = OvpnEngine.lastError
+        // v1.12: the last rung + the last core stage + the
+        // duration (item 2).
+        val methFa = connectMethodFa(); val methEn = connectMethodEn(); val methRu = connectMethodRu()
+        currentRungFa = null; currentRungEn = null; currentRungRu = null
+        val durSec = takeConnectDurationSec()
+        val durFa = if (durSec != null) "؛ مدت ${"%.1f".format(durSec)} ثانیه" else ""
+        val durEn = if (durSec != null) "; took ${"%.1f".format(durSec)} s" else ""
+        val durRu = if (durSec != null) "; заняло ${"%.1f".format(durSec)} с" else ""
+        val st = OvpnEngine.lastState ?: ""
+        AppLog.append(this, "openvpn",
+            "«${logDisplayName(p.name)}» وصل نشد: ${err ?: "سرور با هیچ روشی جواب نداد"}؛ روش $methFa؛ مرحله «$st»$durFa.",
+            "“${logDisplayName(p.name)}” did not connect: ${err ?: "the server answered with no method"}; method $methEn; stage “$st”$durEn.",
+            "«${logDisplayName(p.name)}» не подключился: ${err ?: "сервер не ответил ни одним способом"}; способ $methRu; этап «$st»$durRu.")
+        try { recordDial(p.name, false, err); refreshList() } catch (_: Exception) {}
+        appLogOvpnPending = false
     }
 
     private fun editProfile(index: Int) {
@@ -1812,14 +2523,20 @@ class OpenVpnActivity : Activity() {
 
     private fun confirmDelete(index: Int) {
         val p = profiles[index]
+        // 1.42: the free entry never renders as a card
+        // anymore (it lives in the top box), so this
+        // branch is unreachable from the list — but a
+        // stale caller still lands on the same box
+        // delete below.
+        if (p.tunnelBear) {
+            confirmDeleteTb(p)
+            return
+        }
         android.app.AlertDialog.Builder(this)
             .setTitle(L("حذف پروفایل", "Delete profile"))
             .setMessage(L("پروفایل «", "Profile \"") + p.name + L("» حذف شود؟", "\" will be deleted."))
             .setPositiveButton(L("حذف", "Delete")) { _, _ ->
                 val wasActive = OvpnEngine.activeName == p.name
-                // v1.1: free accounts are never deleted —
-                // the free entry never renders as a row, so
-                // this branch is unreachable for it.
                 profiles.removeAt(index)
                 OvpnStore.save(this, profiles)
                 if (wasActive) OvpnEngine.disconnect()
@@ -1829,9 +2546,44 @@ class OpenVpnActivity : Activity() {
             .show().also { OvpnTheme.styleDialog(it, this) }
     }
 
+    /** 1.42 (D): delete the free-account box (state B),
+     *  main app confirmDeleteTb (config-renamer
+     *  OpenVpnActivity.kt:1358) — clears the stored
+     *  account AND the entry, and the box returns to
+     *  state A. The entry is NOT re-added silently
+     *  (markRemoved) — the next auto-account success
+     *  restores it. Standalone adaptation: the stored
+     *  account here is the DUAL FreeAccounts list
+     *  (v1.1), which TunnelBear.clearAccount does NOT
+     *  touch (legacy keys only) — without
+     *  FreeAccounts.clearAll, hasAccount() would stay
+     *  true and renderTopBox's no-entry restore would
+     *  resurrect the entry on the next render. */
+    private fun confirmDeleteTb(p: OvpnProfile) {
+        android.app.AlertDialog.Builder(this)
+            .setTitle(L("حذف پروفایل", "Delete profile"))
+            .setMessage(L("«Free OpenVpn config» حذف شود؟ حساب ذخیره‌شده هم پاک می‌شود.", "Delete “Free OpenVpn config”? The saved account is deleted too."))
+            .setPositiveButton(L("حذف", "Delete")) { _, _ ->
+                val wasActive = OvpnEngine.activeName == p.name
+                try { TunnelBear.clearAccount(this) } catch (_: Exception) {}
+                try { FreeAccounts.clearAll(this) } catch (_: Exception) {}
+                try { TunnelBear.markRemoved(this) } catch (_: Exception) {}
+                profiles.removeAll { it.tunnelBear }
+                OvpnStore.save(this, profiles)
+                if (wasActive) OvpnEngine.disconnect()
+                tbCountryMenuOpen = false
+                refreshList()
+                refreshStatus()
+            }
+            .setNegativeButton(L("لغو", "Cancel"), null)
+            .show().also { OvpnTheme.styleDialog(it, this) }
+    }
+
     // ---------- free-account auto-create (exactly as the main app) ----------
     private fun showTbWaitingDialog() {
         dismissTbWaitingDialog()
+        tbWaitStageIdx = -1
+        tbWaitStartMs = System.currentTimeMillis()
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(20), dp(24), dp(20))
@@ -1853,14 +2605,53 @@ class OpenVpnActivity : Activity() {
             gravity = Gravity.CENTER
             setPadding(0, dp(10), 0, dp(14))
         })
+        // v1.10: NO stage-description line on this screen anymore
+        // (user order) — the bar + % + time line stay; the stages
+        // still go to the app log.
+        // v1.8: the bar is a little thicker (18dp — not too
+        // thick) and carries the percentage INSIDE it,
+        // centred, small, white on a solid dark pill
+        // (readable at every fill level, day AND night).
+        // The percentage is the real stage progress
+        // (TbAutoAccount/DualFree), monotonic — it never
+        // goes backwards.
+        val barWrap = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(18))
+        }
         tbWaitProgressView = android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
             progress = 0
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(4))
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT)
         }
-        col.addView(tbWaitProgressView)
+        barWrap.addView(tbWaitProgressView)
+        tbWaitPctView = TextView(this).apply {
+            text = "0٪"
+            textSize = 11f
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            // v1.8: solid dark pill behind the white text —
+            // readable at EVERY fill level, day AND night.
+            // (v1.7's bare white text straddled the
+            // green-fill / grey-track boundary and was
+            // unreadable where it crossed it.)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                cornerRadius = dp(8).toFloat()
+                setColor(Color.parseColor("#CC000000"))
+            }
+            setPadding(dp(10), dp(1), dp(10), dp(1))
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER)
+        }
+        barWrap.addView(tbWaitPctView)
+        col.addView(barWrap)
         tbWaitCountdownView = TextView(this).apply {
             text = ""
             textSize = 13f
@@ -1870,6 +2661,22 @@ class OpenVpnActivity : Activity() {
             setPadding(0, dp(8), 0, 0)
         }
         col.addView(tbWaitCountdownView)
+        // v1.9: a clear way out — the user is never
+        // trapped on this screen. Cancelling stops
+        // both jobs; only a verified account is ever
+        // saved, so nothing half-created is left.
+        tbWaitCancelView = TextView(this).apply {
+            text = L("لغو", "Cancel")
+            textSize = 14f
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            setTextColor(OvpnTheme.accent(this@OpenVpnActivity))
+            textDirection = appTextDir()
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(10), dp(16), dp(6))
+            isClickable = true
+            setOnClickListener { cancelTbAutoCreation() }
+        }
+        col.addView(tbWaitCancelView)
         val dlg = android.app.AlertDialog.Builder(this)
             .setView(col)
             .setCancelable(false)
@@ -1883,26 +2690,37 @@ class OpenVpnActivity : Activity() {
 
     private fun dismissTbWaitingDialog() {
         try { handler.removeCallbacks(tbWaitDotsLoop) } catch (_: Exception) {}
+        try { handler.removeCallbacks(tbWaitElapsedLoop) } catch (_: Exception) {}
         try { tbWaitDialog?.dismiss() } catch (_: Exception) {}
         tbWaitDialog = null
+        // v1.8: the step-2 box says "wait while the account
+        // is being created" — once this dialog is gone,
+        // creation is over (success or failure), so the
+        // box must go with it and never linger.
+        removeGuideStep2Window()
         tbWaitDotsView = null
         tbWaitProgressView = null
+        tbWaitPctView = null
         tbWaitCountdownView = null
+        tbWaitCancelView = null
+        tbWaitStageIdx = -1
     }
 
-    /** v1.1 dual creation — ONLY behind the VPN gate:
-     *  with no VPN active the option does nothing but
-     *  a ~3-second message; there is no auto-Emergency
-     *  here (this app has no Emergency at all). With a
-     *  VPN on, ONE tap starts TWO background creations
-     *  (two temp mails, two signups, two verifications,
-     *  provider rotation intact). The waiting screen
-     *  covers creation until the FIRST account is ready
-     *  — then it connects immediately, and the second
-     *  continues silently as the backup. Only if BOTH
-     *  fail does the failure dialog appear. */
+    /** v1.10 single-first creation — ONLY behind the VPN gate:
+     *  with no VPN active the option does nothing but a ~3-second
+     *  message; there is no auto-Emergency here (this app has no
+     *  Emergency at all). With a VPN on, ONE tap creates ONE
+     *  account (the waiting screen covers just this job — global
+     *  deadline 110 s). When it is ready and the user's VPN is
+     *  still up, the second (backup) account is created silently
+     *  in the background (no screen). Only if the creation fails
+     *  does the failure dialog appear.
+     *  The creation is owned by the application (DualFree state +
+     *  TbCreationService), so minimizing cannot stop it — if this
+     *  Activity is destroyed mid-creation, the next instance
+     *  re-attaches on resume (maybeReattachCreation). */
     private fun startTbAutoCreation() {
-        if (tbCreating) return
+        if (tbCreating || DualFree.isSingleActive()) return
         if (!anyVpnUp()) {
             android.widget.Toast.makeText(this,
                 L("برای ساخت اکانت رایگان فیلترشکن خود را روشن کنید", "Turn on your VPN to create a free account"),
@@ -1910,48 +2728,190 @@ class OpenVpnActivity : Activity() {
             return
         }
         tbCreating = true
-        try { AppLog.append(this, "freeovpn", "شروع ساخت حساب — VPN وصل است", "Account creation started — VPN is up") } catch (_: Exception) {}
         showTbWaitingDialog()
-        renderOrb()
-        renderStatus()
-        DualFree.createDual(this, object : DualFree.DualCallback {
-            override fun onProgress(pct: Int, secondsLeft: Int) {
-                if (isFinishing || isDestroyed) return
-                try { tbWaitProgressView?.progress = pct } catch (_: Exception) {}
-                try {
+        renderTopBox()
+        renderStatusLabel()
+        try {
+            DualFree.createSingle(this)
+            DualFree.setSingleListener(singleCreationCallback())
+        } catch (_: Exception) {
+            tbCreating = false
+            dismissTbWaitingDialog()
+            refreshList()
+            refreshStatus()
+        }
+    }
+
+    /** The foreground creation's live listener — used both by the
+     *  Activity that started it and by a recreated Activity that
+     *  re-attaches on resume. Every method guards the destroyed
+     *  case: a dead Activity must never handle the outcome (the
+     *  result stays in DualFree state for the next instance, and
+     *  the claim below guarantees exactly-once handling). */
+    private fun singleCreationCallback(): DualFree.SingleCallback = object : DualFree.SingleCallback {
+        override fun onProgress(pct: Int, secondsLeft: Int) {
+            if (isFinishing || isDestroyed) return
+            try { tbWaitProgressView?.progress = pct } catch (_: Exception) {}
+            try { tbWaitPctView?.text = T("$pct٪", "$pct%", "$pct%") } catch (_: Exception) {}
+            // v1.9: during the mail wait (stage 4) the countdown is
+            // replaced by the elapsed time — a fake "seconds left"
+            // that never moves is worse than no estimate.
+            try {
+                if (tbWaitStageIdx == 4) {
+                    val el = ((System.currentTimeMillis() - tbWaitStartMs) / 1000).toInt()
+                    tbWaitCountdownView?.text = T("$el ثانیه گذشته", "$el s elapsed", "прошло $el с")
+                } else {
                     tbWaitCountdownView?.text = T("حدود $secondsLeft ثانیه مانده", "About $secondsLeft s left", "Осталось около $secondsLeft с")
-                } catch (_: Exception) {}
-                try { orbPct?.text = "$pct٪" } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
+        }
+        override fun onStage(fa: String, en: String, ru: String, index: Int) {
+            if (isFinishing || isDestroyed) return
+            tbWaitStageIdx = index
+            // v1.10: the stage text is NOT shown on the waiting
+            // screen anymore (user order) — the index still drives
+            // the elapsed/countdown line, and the stages still go
+            // to the app log (TbAutoAccount.logStage).
+            if (index == 4) startElapsedLoop()
+        }
+        override fun onReady() {
+            if (isFinishing || isDestroyed) return
+            if (!DualFree.tryClaimSingleOutcome()) return
+            handleCreationReady()
+        }
+        override fun onFailed(fa: String, en: String, ru: String) {
+            if (isFinishing || isDestroyed) return
+            if (!DualFree.tryClaimSingleOutcome()) return
+            handleCreationFailed(fa, en, ru)
+        }
+    }
+
+    /** The first account is ready: dismiss, refresh, tell the user,
+     *  then connect to it at once (as before). v1.10: also start the
+     *  backup silently now — but only while the user's VPN is still
+     *  up (the signup sites need it). No screen, no popup. */
+    private fun handleCreationReady() {
+        tbCreating = false
+        dismissTbWaitingDialog()
+        if (isFinishing || isDestroyed) return
+        try { TunnelBear.ensureSingleEntry(this, restoreDeleted = true) } catch (_: Exception) {}
+        try { profiles = OvpnStore.load(this) } catch (_: Exception) {}
+        refreshList()
+        refreshStatus()
+        android.widget.Toast.makeText(this,
+            L("حساب ساخته و تایید شد؛ حالا می‌توانی وصل شوی", "Account created and verified; you can connect now"),
+            android.widget.Toast.LENGTH_LONG).show()
+        if (anyVpnUp()) {
+            try { DualFree.createBackupSilently(this) } catch (_: Exception) {}
+        }
+        // v1.12: when the guide is active, do NOT auto-connect
+        // (item 1) — the guide walks the user through picking
+        // a country first (step 3) and then tapping connect
+        // (step 4); auto-connecting here would end the guide
+        // before the user ever saw the country flow. When the
+        // guide is not active, connect as before.
+        if (guideStep <= 0) {
+            val p = tbProfile()
+            if (p != null) connectProfile(p)
+        }
+    }
+
+    private fun handleCreationFailed(fa: String, en: String, ru: String) {
+        tbCreating = false
+        dismissTbWaitingDialog()
+        if (isFinishing || isDestroyed) return
+        refreshList()
+        refreshStatus()
+        showTbAutoFailDialog(fa, en, ru)
+    }
+
+    /** v1.10: re-attach to a creation that outlived this Activity
+     *  instance (minimize + system reclaim, rotation). The job, its
+     *  progress and its result live in DualFree — this instance just
+     *  re-shows the waiting dialog with the live values and
+     *  re-subscribes. If the job already finished while we were
+     *  away, its outcome is handled exactly once here. */
+    private fun maybeReattachCreation() {
+        if (tbCreating) return
+        if (DualFree.isSingleActive()) {
+            tbCreating = true
+            showTbWaitingDialog()
+            tbWaitStartMs = DualFree.singleStartedAtMs().takeIf { it > 0 } ?: System.currentTimeMillis()
+            tbWaitStageIdx = DualFree.singleProgress().third
+            restoreWaitingDialogFromState()
+            DualFree.setSingleListener(singleCreationCallback())
+            return
+        }
+        val out = try { DualFree.consumeSingleOutcome() } catch (_: Exception) { null } ?: return
+        if (out.ok) handleCreationReady() else handleCreationFailed(out.fa, out.en, out.ru)
+    }
+
+    private fun restoreWaitingDialogFromState() {
+        try {
+            val (pct, left, idx) = DualFree.singleProgress()
+            tbWaitProgressView?.progress = pct
+            tbWaitPctView?.text = T("$pct٪", "$pct%", "$pct%")
+            if (idx == 4) {
+                val el = ((System.currentTimeMillis() - tbWaitStartMs) / 1000).toInt()
+                tbWaitCountdownView?.text = T("$el ثانیه گذشته", "$el s elapsed", "прошло $el с")
+                startElapsedLoop()
+            } else {
+                tbWaitCountdownView?.text = T("حدود $left ثانیه مانده", "About $left s left", "Осталось около $left с")
             }
-            override fun onFirstReady() {
-                tbCreating = false
-                dismissTbWaitingDialog()
-                if (isFinishing || isDestroyed) return
-                try { TunnelBear.ensureSingleEntry(this@OpenVpnActivity, restoreDeleted = true) } catch (_: Exception) {}
-                try { profiles = OvpnStore.load(this@OpenVpnActivity) } catch (_: Exception) {}
-                refreshList()
-                refreshStatus()
-                android.widget.Toast.makeText(this@OpenVpnActivity,
-                    L("حساب ساخته و تایید شد؛ حالا می‌توانی وصل شوی", "Account created and verified; you can connect now"),
-                    android.widget.Toast.LENGTH_LONG).show()
-                // Connect to the first account as soon as
-                // it is ready.
-                val p = tbProfile()
-                if (p != null) connectProfile(p)
-            }
-            override fun onBackupReady() {
-                // Silent: nothing shown, nothing logged
-                // on the page. The backup just exists.
-            }
-            override fun onBothFailed(fa: String, en: String) {
-                tbCreating = false
-                dismissTbWaitingDialog()
-                if (isFinishing || isDestroyed) return
-                refreshList()
-                refreshStatus()
-                showTbAutoFailDialog(fa, en)
-            }
-        })
+        } catch (_: Exception) {}
+    }
+
+    /** v1.10: if the first account exists but the backup was never
+     *  created (VPN was off when it finished, or the background
+     *  attempt failed), build it silently now — no screen, no popup
+     *  — but only while a VPN is up (the signup sites need it);
+     *  otherwise skip quietly and try again on a later open. */
+    private fun maybeCreateBackupOnOpen() {
+        if (tbCreating) return
+        if (FreeAccounts.active(this) == null) return
+        if (FreeAccounts.backup(this) != null) return
+        if (!anyVpnUp()) return
+        try { DualFree.createBackupSilently(this) } catch (_: Exception) {}
+    }
+
+    /** v1.13: the pending second-account job retries on its
+     *  own when the VPN exit IP changes to an unseen one
+     *  (the user does not have to keep tapping retry).
+     *  Throttled to once per 5 min; never fires on a refused
+     *  exit IP, and never while a creation runs. */
+    private fun maybeExitChangeBackupRetry() {
+        if (tbCreating) return
+        if (FreeAccounts.active(this) == null) return
+        if (FreeAccounts.backup(this) != null) return
+        if (!anyVpnUp()) return
+        if (TbAutoAccount.lastDeviceLimitAt(this) <= 0) return
+        val now = System.currentTimeMillis()
+        if (now - exitIpCheckAtMs < 5 * 60 * 1000L) return
+        exitIpCheckAtMs = now
+        Thread {
+            try {
+                val ip = TbAutoAccount.fetchExitIp() ?: return@Thread
+                val lastKnown = TbAutoAccount.lastKnownExitIp(this@OpenVpnActivity)
+                if (ip == lastKnown) return@Thread
+                if (TbAutoAccount.isRefusedExitIp(this@OpenVpnActivity, ip)) return@Thread
+                DualFree.createBackupSilently(this@OpenVpnActivity)
+            } catch (_: Exception) {}
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** v1.10: stop the creation from the waiting
+     *  screen — cancels the single job cleanly
+     *  (DualFree) and drops the dialog, so the user
+     *  is never trapped. Only a verified account is
+     *  ever saved (the save happens inside the job
+     *  after the mail is verified), so a cancel can
+     *  never leave a half-created account behind. */
+    private fun cancelTbAutoCreation() {
+        try { DualFree.cancelSingle() } catch (_: Exception) {}
+        tbCreating = false
+        dismissTbWaitingDialog()
+        refreshList()
+        refreshStatus()
     }
 
     /** v1.1: connect-failure failover — the active free
@@ -2013,10 +2973,10 @@ class OpenVpnActivity : Activity() {
     /** Auto-creation failed AFTER the flow already retried by
      *  itself — a simple failure dialog with a retry button
      *  ONLY. No manual entry anywhere in this flow. */
-    private fun showTbAutoFailDialog(fa: String, en: String) {
+    private fun showTbAutoFailDialog(fa: String, en: String, ru: String) {
         android.app.AlertDialog.Builder(this)
             .setTitle(L("ساخت حساب ناموفق بود", "Account creation failed"))
-            .setMessage(L(fa, en))
+            .setMessage(T(fa, en, ru))
             .setPositiveButton(L("تلاش دوباره", "Try again")) { _, _ -> startTbAutoCreation() }
             .setNegativeButton(L("لغو", "Cancel")) { _, _ -> refreshList() }
             .show().also { dlg ->
@@ -2242,104 +3202,71 @@ class OpenVpnActivity : Activity() {
         } catch (_: Exception) {}
     }
 
-    /** OpenVPN guide (v1.1): drawer, tap-to-select,
-     *  dual free accounts, language menu. (No Smart
-     *  engine section — this app has none; the free
-     *  section describes the VPN gate, not the old
-     *  auto-Emergency.) */
+
+    /** 1.43 (D): the GENERAL OpenVPN guide — exactly what the main
+     *  app's "?" opens (config-renamer OpenVpnActivity.kt:3140
+     *  showOvpnGuide): a 340x560dp dialog, «راهنمای OpenVPN» title,
+     *  one section per OpenVPN option. NOT the account-creation
+     *  tutorial (that is startGuide, from the box's guide third). */
     private fun showOvpnGuide() {
         try {
-            fun sec(faT: String, faB: String, enT: String, enB: String, ruT: String, ruB: String): Pair<String, String> {
-                return when (AppLanguage.lang(this)) {
-                    "en" -> enT to enB
-                    "ru" -> ruT to ruB
-                    else -> faT to faB
-                }
+            val d = resources.displayMetrics.density
+            val en = AppLanguage.isEnglish(this)
+            fun sec(faT: String, faB: String, enT: String, enB: String): Pair<String, String> {
+                return if (en) enT to enB else faT to faB
             }
             val sections = listOf(
-                sec("کشوی کناری",
-                    "دکمه ☰ بالای صفحه، سمت چپ، کشوی کناری را باز می‌کند؛ با کشیدن انگشت از چپ به راست هم باز می‌شود و با کشیدن از راست به چپ یا زدن بیرون از منو بسته می‌شود. داخل کشو: لوگوی کانال، بعد «لاگ برنامه» (متن کامل لاگ‌ها)، «راهنما» (همین صفحه)، «حالت شب/روز» (با هر بار زدن بین روز، شب و خودکار می‌چرخد)، «زبان برنامه» (فارسی، English، Русский — کل برنامه همان لحظه عوض می‌شود)، و «درباره ما».",
-                    "Side drawer",
-                    "The ☰ button at the top-left opens the side drawer; swiping left-to-right opens it too, and swiping right-to-left or tapping outside closes it. Inside: the channel logo, then “App log” (the full log text), “Guide” (this page), “Day / night” (each tap cycles day, night, auto), “App language” (فارسی, English, Русский — the whole app switches at once), and “About”.",
-                    "Боковое меню",
-                    "Кнопка ☰ вверху слева открывает боковое меню; свайп слева направо тоже открывает, а свайп справа налево или касание вне меню закрывает его. Внутри: логотип канала, затем «Журнал» (полный текст журнала), «Руководство» (эта страница), «День / ночь» (каждое касание переключает день, ночь, авто), «Язык приложения» (فارسی, English, Русский — всё приложение переключается сразу) и «О приложении»."),
-                sec("دو زبانه",
-                    "بالای صفحه دو زبانه هست: «Free open vpn» برای حساب رایگان، و «Open vpn» برای پروفایل‌های شخصی خودت. دایره وسط صفحه در هر زبانه به همان بخش وصل می‌شود.",
-                    "Two tabs",
-                    "There are two tabs at the top: “Free open vpn” for the free account, and “Open vpn” for your own personal profiles. The circle in the middle connects to that tab's section.",
-                    "Две вкладки",
-                    "Вверху две вкладки: «Free open vpn» для бесплатного аккаунта и «Open vpn» для ваших личных профилей. Круг в середине подключается к разделу своей вкладки."),
-                sec("دایره اتصال",
-                    "دایره وسط صفحه دکمه اتصال است. در زبانه Free، اگر هنوز حسابی نداری، روی آن بزن تا برنامه خودش در پس‌زمینه برایت حساب بسازد و تاییدش کند؛ فقط کمی صبر کن (حدود یک دقیقه). وقتی حساب آماده شد، زیر نوشته «اتصال» داخل خود دایره دکمه کشور را می‌بینی — تا وقتی کشوری انتخاب نکرده‌ای «انتخاب کشور» می‌نویسد، و وقتی کشوری انتخاب کنی پرچم و اسم همان کشور را نشان می‌دهد؛ با زدن روی آن، یک کارت کوچک زیر همان دکمه باز می‌شود با فهرست ۴۷ کشور با پرچم. در زبانه Open، اول روی یک پروفایل بزن تا انتخاب شود (پس‌زمینه‌اش سبز روشن می‌شود)، بعد دایره به همان پروفایل وصل می‌شود؛ اگر پروفایلی انتخاب نشده باشد، دایره کاری نمی‌کند. زیر دایره هم همیشه وضعیت را می‌بینی.",
-                    "Connect circle",
-                    "The circle in the middle is the connect button. On the Free tab, if you have no account yet, tap it and the app creates and verifies one for you in the background; just wait a little (about a minute). Once the account is ready, you see the country button below “Connect” inside the circle itself — it reads “Choose country” until you pick one, and shows the flag and name of the picked country after that; tapping it opens a small card right under the button with the list of 47 countries with flags. On the Open tab, first tap a profile to select it (its background turns light green), then the circle connects to that profile; if no profile is selected, the circle does nothing. Below the circle you always see the status.",
-                    "Круг подключения",
-                    "Круг в середине — кнопка подключения. На вкладке Free, если аккаунта ещё нет, нажмите на него, и приложение само создаст и подтвердит его в фоне; просто немного подождите (около минуты). Когда аккаунт готов, под словом «Подключить» внутри круга видна кнопка страны — пока страна не выбрана, там написано «Выбрать страну», а после выбора показываются флаг и название выбранной страны; касание открывает небольшую карточку прямо под кнопкой со списком 47 стран с флагами. На вкладке Open сначала нажмите на профиль, чтобы выбрать его (фон станет светло-зелёным), затем круг подключится к нему; если профиль не выбран, круг ничего не делает. Под кругом всегда виден статус."),
-                sec("دایره‌های سلامت",
-                    "دو دایره کنار هر پروفایل، نتیجه‌ی تست نشست همان پروفایل را نشان می‌دهند: دایره اول سبز یعنی سرور با دست‌تکان کامل TLS جواب داد؛ دایره دوم سبز یعنی نام کاربری و رمز قبول شد و سرور یک آدرس IP داد — روی همین پروفایل بزنی وصل می‌شود. خاکستری یعنی هنوز تست نشده یا سرور از روی طراحی به تست جواب نمی‌دهد (tls-auth)؛ قرمز یعنی سرور جواب نداد یا نشست رد شد. با لمس دایره‌ها، توضیح هر کدام را می‌بینی.",
-                    "Health dots",
-                    "The two dots beside each profile show that profile's session test: first green means the server answered a full TLS handshake; second green means the username and password were accepted and the server assigned an IP — tap this profile and it will connect. Grey means not tested yet, or the server stays silent by design (tls-auth); red means the server did not answer or the session was rejected. Tap the dots to see what each one means.",
-                    "Точки состояния",
-                    "Две точки рядом с профилем показывают результат теста сессии: первая зелёная — сервер ответил полным TLS-рукопожатием; вторая зелёная — имя пользователя и пароль приняты и сервер выдал IP: нажмите на этот профиль, и он подключится. Серая — ещё не проверено или сервер молчит по замыслу (tls-auth); красная — сервер не ответил или сессия отклонена. Коснитесь точек, чтобы увидеть пояснение."),
-                sec("دو حساب رایگان",
-                    "با یک بار زدن روی دایره در زبانه Free، برنامه در پس‌زمینه دو حساب رایگان می‌سازد: اولی که آماده شد وصل می‌شود و دومی حساب پشتیبان است. اگر حساب فعال وصل نشد، برنامه خودش سراغ حساب پشتیبان می‌رود و یک پشتیبان تازه می‌سازد. هر حساب ماهانه ۲ گیگابایت دارد؛ وقتی مصرف حساب فعال به حدود ۱۹۰۰ مگابایت در ۳۱ روز رسید، برنامه خودش به حساب پشتیبان وصل می‌شود (حداکثر یک قطع لحظه‌ای) و پشتیبان تازه می‌سازد. حساب‌های رایگان هیچ‌وقت حذف نمی‌شوند؛ حسابی که تمام شد استراحت می‌کند و بعد از ۳۱ روز دوباره شارژ می‌شود و می‌تواند پشتیبان شود. هر دو حساب برای همان کشوری ساخته می‌شوند که انتخاب کرده‌ای.",
-                    "Two free accounts",
-                    "One tap on the circle in the Free tab creates TWO free accounts in the background: the first one ready connects, and the second is the backup. If the active account fails to connect, the app switches to the backup by itself and creates a fresh backup. Each account has 2 GB per month; when the active account reaches about 1900 MB in 31 days, the app switches to the backup itself (at most a momentary cut) and creates a fresh backup. Free accounts are never deleted; a used-up account rests, and after 31 days it recharges and can become a backup again. Both accounts are created for the country you picked.",
-                    "Два бесплатных аккаунта",
-                    "Одно касание круга на вкладке Free создаёт в фоне ДВА бесплатных аккаунта: первый готовый подключается, а второй становится резервным. Если активный аккаунт не подключается, приложение само переходит на резервный и создаёт новый резервный. У каждого аккаунта 2 ГБ в месяц; когда активный достигает около 1900 МБ за 31 день, приложение само переключается на резервный (максимум мгновенный обрыв) и создаёт новый резервный. Бесплатные аккаунты никогда не удаляются; исчерпанный аккаунт отдыхает, а через 31 день пополняется и снова может стать резервным. Оба аккаунта создаются для выбранной вами страны."),
+                sec("دکمه خاموش و روشن",
+                    "لمس آن وصل و قطع می‌کند.",
+                    "Connect toggle",
+                    "Tap it to connect or disconnect."),
                 sec("Free OpenVpn config",
-                    "در زبانه Free یک حساب رایگان برایت ساخته می‌شود. برای ساخت حساب، اول فیلترشکن خودت را روشن کن؛ اگر هیچ VPNای وصل نباشد، برنامه فقط یک پیام کوتاه نشان می‌دهد و کاری نمی‌کند. اگر ساخت حساب نشد، برنامه خودش با ایمیل تازه دوباره تلاش می‌کند و فقط بعد از آن پیامش را می‌بینی و می‌توانی «تلاش دوباره» بزنی؛ ورود دستی وجود ندارد، همه‌چیز خودکار است. وقتی حساب آماده شد، کشورش را از داخل دایره عوض می‌کنی (۴۷ کشور با پرچم). اسم و رمز حساب هیچ‌وقت نشان داده نمی‌شود. وصل شدن از راه یک رله داخلی انجام می‌شود: هسته مستقیم به سرور وصل نمی‌شود، چون از این خط دست‌تکان همان اول قطع می‌شود؛ سرورها اول با دست‌تکان کامل TLS روی پورت ۷۰۱۱ تست می‌شوند تا سراغ آن‌هایی برود که واقعاً جواب می‌دهند.",
+                    "بالای فهرست پروفایل‌ها یک جعبه هست با نوشته «اکانت openvpn رایگان» و جلوی اسم هر کشور پرچمش را نشان می‌دهد. اگر هنوز حسابی نداری، با زدن آن جعبه برنامه خودش در پس‌زمینه برایت حساب می‌سازد و تاییدش می‌کند؛ فقط کمی صبر کن (حدود یک دقیقه). ساخت حساب فقط وقتی شروع می‌شود که VPN خودت (از هر برنامه‌ای) روشن باشد و حساب را از همان VPN می‌سازد. اگر ساخت حساب نشد، برنامه خودش تا ۳ بار با ایمیل تازه دوباره تلاش می‌کند و فقط بعد از آن پیامش را می‌بینی و می‌توانی «تلاش دوباره» بزنی؛ ورود دستی وجود ندارد، همه‌چیز خودکار است. وقتی حساب آماده شد، همان جعبه مثل بقیه پروفایل‌ها می‌شود ولی کوتاه‌تر: سوییچ وصل/قطع دارد، کشورش را از ردیف «Select country» پایین جعبه عوض می‌کنی (۴۷ کشور با پرچم، همان‌جا توی جعبه باز و اسکرول می‌شود)، و با دکمه حذف، هم جعبه و هم حساب پاک می‌شود و جعبه به حالت اول برمی‌گردد. اسم و رمز حساب هیچ‌وقت روی جعبه نشان داده نمی‌شود. وصل شدن از راه یک رله داخلی انجام می‌شود: هسته مستقیم به سرور وصل نمی‌شود، چون از این خط دست‌تکان همان اول قطع می‌شود؛ سرورها اول با دست‌تکان کامل TLS روی پورت ۷۰۱۱ تست می‌شوند تا سراغ آن‌هایی برود که واقعاً جواب می‌دهند.",
                     "Free OpenVpn config",
-                    "On the Free tab a free account is created for you. To create an account, first turn on your own VPN; if no VPN is connected, the app only shows a short message and does nothing. If creating the account fails, the app retries by itself with a fresh email and only then shows the message, with a “Try again” button; there is no manual entry — everything is automatic. Once the account is ready, you change its country from inside the circle (47 countries with flags). The account's name and password are never shown. Connecting goes through an internal relay: the core never dials the server directly, because on this line the handshake is cut right at the start; servers are first tested with a full TLS handshake on port 7011 so the ones that really answer are tried first.",
-                    "Free OpenVpn config",
-                    "На вкладке Free для вас создаётся бесплатный аккаунт. Чтобы создать аккаунт, сначала включите свой VPN; если VPN не подключён, приложение только покажет короткое сообщение и ничего не сделает. Если создать аккаунт не удалось, приложение само попробует снова с новым адресом и только потом покажет сообщение с кнопкой «Попробовать снова»; ручного ввода нет — всё автоматически. Когда аккаунт готов, страну можно сменить внутри круга (47 стран с флагами). Имя и пароль аккаунта никогда не показываются. Подключение идёт через внутреннее реле: ядро никогда не звонит серверу напрямую, потому что на этой линии рукопожатие обрывается в самом начале; серверы сначала проверяются полным TLS-рукопожатием на порту 7011, чтобы пробовать те, что действительно отвечают."),
+                    "At the top of the profile list there is a box reading “اکانت openvpn رایگان”, with each country's flag before its name. If you have no account yet, tapping that box makes the app create and verify one for you in the background; just wait a little (about a minute). Account creation only starts when your own VPN (from any app) is on, and the account is created through that VPN. If creating the account fails, the app retries by itself up to 3 times and only then shows the message, with a “Try again” button; there is no manual entry — everything is automatic. Once the account is ready, that same box behaves like the other profiles, only shorter: it has a connect/disconnect toggle, you change its country from the “Select country” row at the bottom of the box (47 countries with flags, opening and scrolling right inside the box), and its delete button removes both the box and the account, returning the box to its first state. The account's name and password are never shown on the box. Connecting goes through an internal relay: the core never dials the server directly, because on this line the handshake is cut right at the start; servers are first tested with a full TLS handshake on port 7011 so the ones that really answer are tried first."),
                 sec("دکمه +",
-                    "وارد کردن فایل .ovpn. هر فایل یک پروفایل می‌شود و اسمش از اسم فایل می‌آید. دکمه بالای نوار پایین گوشی می‌ایستد و هیچ‌وقت زیر آن پنهان نمی‌شود.",
+                    "وارد کردن فایل .ovpn. هر فایل یک پروفایل می‌شود و اسمش از اسم فایل می‌آید.",
                     "Add button",
-                    "Import an .ovpn file. Each file becomes one profile, named after the file. The button sits above the phone's bottom bar and is never hidden under it.",
-                    "Кнопка +",
-                    "Импорт файла .ovpn. Каждый файл становится профилем с именем файла. Кнопка находится над нижней панелью телефона и никогда не скрывается под ней."),
-                sec("علامت ⓘ (تشخیص)",
+                    "Import an .ovpn file. Each file becomes one profile, named after the file."),
+                sec("علامت ℹ (تشخیص)",
                     "تشخیص فایل؛ فقط می‌گوید فایل چه بخش‌ها و گزینه‌هایی دارد و هیچ مقداری را نشان نمی‌دهد.",
                     "Diagnosis info",
-                    "File diagnosis; it only says which blocks and options the file has and never shows any values.",
-                    "Диагностика",
-                    "Диагностика файла: только какие блоки и опции в нём есть, без значений."),
+                    "File diagnosis; it only says which blocks and options the file has and never shows any values."),
                 sec("مداد ✎ و لمس اسم",
                     "مداد پروفایل را ویرایش می‌کند. لمس اسم پروفایل، اسم کامل را در پنجره کوچکی نشان می‌دهد.",
                     "Edit and name tap",
-                    "The pencil edits the profile. Tapping the profile name shows the full name in a small popup.",
-                    "Карандаш и имя",
-                    "Карандаш редактирует профиль. Касание имени показывает полное имя в маленьком окне."),
-                sec("علامت ✕ (حذف)",
-                    "حذف با پنجره تأیید انجام می‌شود، هیچ‌وقت فوری نیست؛ حذف پروفایلی که وصل است، اتصال را قطع می‌کند. حساب‌های رایگان حذف نمی‌شوند.",
-                    "Delete",
-                    "Deletion asks for confirmation and is never instant; deleting the connected profile disconnects it. Free accounts are never deleted.",
-                    "Удаление",
-                    "Удаление — с подтверждением, никогда не мгновенное; удаление подключённого профиля отключает его. Бесплатные аккаунты не удаляются.")
+                    "The pencil edits the profile. Tapping the profile name shows the full name in a small popup."),
+                sec("سطل زباله (حذف)",
+                    "حذف با پنجره تأیید انجام می‌شود، هیچ‌وقت فوری نیست؛ حذف پروفایلی که وصل است، اتصال را قطع می‌کند.",
+                    "Trash (delete)",
+                    "Deletion asks for confirmation and is never instant; deleting the connected profile disconnects it."),
+                sec("آیکون لاگ",
+                    "آیکون بالای صفحه، متن کامل لاگ‌ها را نشان می‌دهد.",
+                    "Log icon",
+                    "The icon at the top shows the full log text.")
             )
             val box = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(dp(20), dp(20), dp(20), dp(20))
+                setPadding((20 * d).toInt(), (20 * d).toInt(), (20 * d).toInt(), (20 * d).toInt())
             }
             box.addView(TextView(this).apply {
                 text = L("راهنمای OpenVPN", "OpenVPN guide")
                 textSize = 20f
                 setTypeface(null, android.graphics.Typeface.BOLD)
-                setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
-                setPadding(0, 0, 0, dp(14))
+                setTextColor(OvpnTheme.fg(context))
+                setPadding(0, 0, 0, (14 * d).toInt())
             })
             for ((t, b) in sections) {
                 box.addView(TextView(this).apply {
                     text = t; textSize = 15f
                     setTypeface(null, android.graphics.Typeface.BOLD)
-                    setTextColor(if (OvpnTheme.isDark(this@OpenVpnActivity)) Color.parseColor("#A5C8FF") else Color.parseColor("#1B365D"))
-                    setPadding(0, dp(8), 0, dp(2))
+                    setTextColor(if (OvpnTheme.isDark(context)) Color.parseColor("#A5C8FF") else Color.parseColor("#1B365D"))
+                    setPadding(0, (8 * d).toInt(), 0, (2 * d).toInt())
                 })
                 box.addView(TextView(this).apply {
                     text = b; textSize = 13f
-                    setTextColor(if (OvpnTheme.isDark(this@OpenVpnActivity)) Color.parseColor("#D8DEEA") else Color.parseColor("#37474F"))
-                    setPadding(0, 0, 0, dp(6))
+                    setTextColor(if (OvpnTheme.isDark(context)) Color.parseColor("#D8DEEA") else Color.parseColor("#37474F"))
+                    setPadding(0, 0, 0, (6 * d).toInt())
                 })
             }
             val scroll = ScrollView(this)
@@ -2354,19 +3281,12 @@ class OpenVpnActivity : Activity() {
                 win.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
                 box.background = OvpnTheme.dialogCard(this)
                 val lp = win.attributes
-                lp.width = dp(340)
-                lp.height = dp(560)
+                lp.width = (340 * d).toInt()
+                lp.height = (560 * d).toInt()
                 win.attributes = lp
             }
             dlg.show()
         } catch (_: Exception) {}
-    }
-
-    // ---------- health dots ----------
-    private fun dotColor(state: Int): Int = when (state) {
-        1 -> Color.parseColor("#43A047")
-        -1 -> Color.parseColor("#E57373")
-        else -> Color.parseColor("#BDBDBD")
     }
 
     /** Last REAL dial per profile — a real ovpn3 connect on
@@ -2390,177 +3310,18 @@ class OpenVpnActivity : Activity() {
         } catch (_: Exception) {}
     }
 
-    private fun dialDotState(name: String): Int {
-        return try {
-            val p = getSharedPreferences("renamer_ovpn", MODE_PRIVATE)
-            if (!p.contains("ovpn_dial_time_$name")) 0
-            else if (p.getBoolean("ovpn_dial_ok_$name", false)) 1 else -1
-        } catch (_: Exception) { 0 }
-    }
-
-    /** The two dots from the SESSION probe (3.07).
-     *  UPPER: the TLS flight — 1 green = the server answered a
-     *  full TLS handshake, -1 red = TCP answered but no TLS
-     *  flight, or TCP dead, 0 grey = untested, or silent by
-     *  design (tls-auth/tls-crypt, UDP silent).
-     *  LOWER: the session — 1 green = AUTH accepted + PUSH_REPLY
-     *  with an assigned IP (will connect), -1 red = AUTH_FAILED /
-     *  no PUSH / TLS cut after the flight, 0 grey = untested,
-     *  no stored credentials, or TLS-probe-only class.
-     *  Until a profile has a fresh (10-min) probe cache, the dots
-     *  fall back to the in-memory sweep result (UDP profiles) and
-     *  then to the last real dial. */
-    private fun probeDots(name: String): Pair<Int, Int> {
-        val v = OvpnSessionProbe.cachedProbe(this, name)
-        if (v != null) {
-            val upper = when {
-                v.tls == 2 -> 1
-                v.tls == 1 -> -1
-                v.detail == "tcp_dead" -> -1
-                else -> 0
-            }
-            val lower = when (v.session) { 1 -> 1; -1 -> -1; else -> 0 }
-            return upper to lower
-        }
-        val lh = localHealth[name]
-        if (lh != null) return lh to 0
-        val d = dialDotState(name)
-        return d to d
-    }
-
-    /** Human text for a probe verdict (dot-tap popup). No hosts,
-     *  IPs or ports — only what each dot means and why it shows
-     *  its colour. */
-    private fun probeLineText(name: String): String {
-        val v = OvpnSessionProbe.cachedProbe(this, name)
-            ?: return L("هنوز تست نشده است.", "Not tested yet.")
-        val upper = when {
-            v.tls == 2 -> L("دایره اول سبز: سرور با دست‌تکان کامل TLS جواب داد.", "First circle green: the server answered a full TLS handshake.")
-            v.tls == 1 -> L("دایره اول قرمز: سرور TCP را جواب داد ولی دست‌تکان TLS را قطع کرد.", "First circle red: the server answered TCP but cut the TLS handshake.")
-            v.detail == "tcp_dead" -> L("دایره اول قرمز: سرور اصلاً جواب نداد.", "First circle red: the server did not answer at all.")
-            v.detail == "tls_auth_silent" -> L("دایره اول خاکستری: این پروفایل tls-auth یا tls-crypt دارد و سرورش از روی طراحی به تست جواب نمی‌دهد؛ فقط با زدن دکمه اتصال معلوم می‌شود.", "First circle grey: this profile uses tls-auth or tls-crypt, and its server stays silent by design; only tapping connect gives the answer.")
-            v.detail == "udp_only" -> L("دایره اول از تست UDP می‌آید (این پروفایل فقط UDP است).", "The first circle comes from the UDP test (this profile is UDP-only).")
-            else -> L("دایره اول خاکستری: هنوز تست نشده است.", "First circle grey: not tested yet.")
-        }
-        val lower = when (v.session) {
-            1 -> L("دایره دوم سبز: نام کاربری و رمز قبول شد و سرور یک آدرس IP داد — وصل می‌شود.", "Second circle green: the username and password were accepted and the server assigned an IP — it will connect.")
-            -1 -> when (v.detail) {
-                "auth_failed" -> L("دایره دوم قرمز: سرور نام کاربری یا رمز را رد کرد.", "Second circle red: the server rejected the username or password.")
-                "no_push" -> L("دایره دوم قرمز: سرور بعد از قبول کردن، آدرسی نفرستاد.", "Second circle red: the server accepted but never sent an address.")
-                "no_keyex" -> L("دایره دوم قرمز: سرور تبادل کلید را کامل نکرد.", "Second circle red: the server did not finish the key exchange.")
-                else -> L("دایره دوم قرمز: نشست کامل نشد.", "Second circle red: the session did not complete.")
-            }
-            else -> if (v.detail == "no_creds") L("دایره دوم خاکستری: این پروفایل نام کاربری و رمز می‌خواهد ولی ذخیره نشده است؛ اول آن‌ها را در ویرایش پروفایل بنویس.", "Second circle grey: this profile needs a username and password, but none is saved; enter them in the profile edit first.")
-                else L("دایره دوم خاکستری: نشست هنوز تست نشده است.", "Second circle grey: the session has not been tested yet.")
-        }
-        return "$upper\n$lower"
-    }
-
-    private fun dialLineText(name: String): Pair<String, String> {
-        try {
-            val p = getSharedPreferences("renamer_ovpn", MODE_PRIVATE)
-            if (!p.contains("ovpn_dial_time_$name")) {
-                return L("هنوز به‌صورت مستقیم وصل نشده", "Never connected directly") to "#9E9E9E"
-            }
-            val ok = p.getBoolean("ovpn_dial_ok_$name", false)
-            val t = p.getLong("ovpn_dial_time_$name", 0)
-            val cal = java.util.Calendar.getInstance()
-            val now = java.util.Calendar.getInstance()
-            cal.timeInMillis = t
-            val hm = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date(t))
-            val today = cal.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR) &&
-                cal.get(java.util.Calendar.DAY_OF_YEAR) == now.get(java.util.Calendar.DAY_OF_YEAR)
-            val whenStr = when (AppLanguage.lang(this)) {
-                "en" -> if (today) "today, $hm"
-                    else "${cal.get(java.util.Calendar.MONTH) + 1}/${cal.get(java.util.Calendar.DAY_OF_MONTH)} $hm"
-                "ru" -> if (today) "сегодня, $hm"
-                    else "${cal.get(java.util.Calendar.DAY_OF_MONTH)}.${cal.get(java.util.Calendar.MONTH) + 1} $hm"
-                else -> if (today) "امروز، $hm"
-                    else "${cal.get(java.util.Calendar.DAY_OF_MONTH)}/${cal.get(java.util.Calendar.MONTH) + 1} $hm"
-            }
-            return if (ok) {
-                T("آخرین وصل واقعی: وصل شد ($whenStr)", "Last real connect: succeeded ($whenStr)", "Последнее реальное подключение: удалось ($whenStr)") to "#2E7D32"
-            } else {
-                T("آخرین وصل واقعی: ناموفق ($whenStr)", "Last real connect: failed ($whenStr)", "Последнее реальное подключение: не удалось ($whenStr)") to "#C62828"
-            }
-        } catch (_: Exception) {
-            return L("هنوز به‌صورت مستقیم وصل نشده", "Never connected directly") to "#9E9E9E"
-        }
-    }
-
-    /** Repaints both dots of every row from the session probe.
-     *  A connected profile is green on both by definition. */
-    private fun paintDots() {
-        try {
-            for ((name, v) in localDotViews) {
-                val c = if (OvpnEngine.isConnected && OvpnEngine.activeName == name)
-                    Color.parseColor("#43A047") else dotColor(probeDots(name).first)
-                (v.background as? GradientDrawable)?.setColor(c)
-            }
-            for ((name, v) in remoteDotViews) {
-                val c = if (OvpnEngine.isConnected && OvpnEngine.activeName == name)
-                    Color.parseColor("#43A047") else dotColor(probeDots(name).second)
-                (v.background as? GradientDrawable)?.setColor(c)
-            }
-        } catch (_: Exception) {}
-    }
-
-    /** Tap the dots: plain-language reasons for both dots.
-     *  No hosts, IPs or ports. */
-    private fun showDotInfo(name: String) {
-        try {
-            val box = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(20), dp(20), dp(20), dp(20))
-            }
-            fun addLine(title: String, body: String) {
-                box.addView(TextView(this).apply {
-                    text = title; textSize = 14f
-                    setTypeface(null, android.graphics.Typeface.BOLD)
-                    setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
-                })
-                box.addView(TextView(this).apply {
-                    text = body; textSize = 13f
-                    setTextColor(OvpnTheme.subFg(this@OpenVpnActivity))
-                    setPadding(0, 0, 0, dp(12))
-                })
-            }
-            val connectedNow = OvpnEngine.isConnected && OvpnEngine.activeName == name
-            val (dtxt, _) = dialLineText(name)
-            val derr = try { getSharedPreferences("renamer_ovpn", MODE_PRIVATE).getString("ovpn_dial_err_$name", null) } catch (_: Exception) { null }
-            val dbody = if (!derr.isNullOrBlank() && dtxt.contains(L("ناموفق", "failed"))) "$dtxt؛ علت: $derr" else dtxt
-            box.addView(TextView(this).apply {
-                text = name; textSize = 17f
-                setTypeface(null, android.graphics.Typeface.BOLD)
-                setTextColor(OvpnTheme.fg(this@OpenVpnActivity))
-                setPadding(0, 0, 0, dp(12))
-            })
-            addLine(L("دو دایره — تست نشست", "Both dots — session test"),
-                probeLineText(name))
-            addLine(L("آخرین وصل واقعی", "Last real connect"),
-                if (connectedNow) L("وصل است", "Connected") else dbody)
-            box.addView(TextView(this).apply {
-                text = L("سبز اول یعنی سرور با دست‌تکان کامل TLS جواب داده؛ سبز دوم یعنی نام کاربری و رمز قبول شد و سرور آدرس داد — روی همین پروفایل بزنی وصل می‌شود. خاکستری یعنی هنوز تست نشده یا سرور از روی طراحی به تست جواب نمی‌دهد (tls-auth). قرمز یعنی سرور جواب نداد یا نشست رد شد.",
-                    "First green means the server answered a full TLS handshake; second green means the username and password were accepted and the server assigned an address — tap this profile and it will connect. Grey means not tested yet, or the server stays silent by design (tls-auth). Red means the server did not answer or the session was rejected.")
-                textSize = 12f
-                setTextColor(OvpnTheme.subFg(this@OpenVpnActivity))
-            })
-            val dlg = android.app.Dialog(this).apply {
-                requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
-                setContentView(box)
-                setCanceledOnTouchOutside(true)
-            }
-            val win = dlg.window
-            if (win != null) {
-                win.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
-                box.background = OvpnTheme.dialogCard(this)
-            }
-            dlg.show()
-        } catch (_: Exception) {}
-    }
+    // 1.42 (G): the card dots are gone — probeDots,
+    // probeLineText, dialLineText, dialDotState,
+    // paintDots and showDotInfo are deleted with
+    // them. The session-probe sweep below stays: it
+    // fills OvpnSessionProbe's cache, which
+    // Monitoring reads for its session-proven count
+    // (no card reads it anymore).
 
     // ---------- page-entry health sweep (phase 1 only: session probe) ----------
-    /** Phase 1 fills the dots from the SESSION probe: TCP
+    /** Phase 1 fills the session-probe cache (no card
+     *  shows dots since 1.42 — Monitoring reads the
+     *  cache): TCP
      *  profiles get the full TLS + AUTH + PUSH probe (tight 9s
      *  deadline each, 6-thread pool, best 1-2 IPs only); UDP-only
      *  profiles keep the UDP dot probe for the 1st circle (2nd
@@ -2588,11 +3349,9 @@ class OpenVpnActivity : Activity() {
                             val trulyConnected = OvpnEngine.isConnected && OvpnEngine.activeName == name
                             if (trulyConnected) {
                                 localHealth[name] = 1
-                                runOnUiThread { paintDots() }
                                 return@submit
                             }
                             if (anyVpnUp()) {
-                                runOnUiThread { paintDots() }
                                 return@submit
                             }
                             val profile = profByName[name] ?: return@submit
@@ -2620,7 +3379,6 @@ class OpenVpnActivity : Activity() {
                                     }
                                 }
                             }
-                            runOnUiThread { paintDots() }
                         } catch (_: Exception) {} finally { done.countDown() }
                     }
                 }
@@ -2630,15 +3388,55 @@ class OpenVpnActivity : Activity() {
         }.start()
     }
 
-    /** LIVE "is any tunnel up" check. Engine volatile flags plus
-     *  the active network's TRANSPORT_VPN capability are live for
-     *  every backend. */
+    /** LIVE "is any tunnel up" check — the engine's volatile
+     *  flags plus a foreign VPN. v1.24: a bare TRANSPORT_VPN
+     *  bit is NOT trusted — the user's phone reports it on
+     *  plain mobile/Wi-Fi with no VPN up (phantom VPN), so
+     *  a foreign VPN counts as up ONLY when the active
+     *  network reports TRANSPORT_VPN AND its link properties
+     *  show a real tunnel interface (tun/ppp/tap) with a
+     *  link address. A VPN bit on a wlan/rmnet interface is
+     *  ignored; missing link properties fail OPEN (not up).
+     *  Used by the account-creation gate (the signup sites
+     *  need a VPN), the backup-account jobs, the guide and
+     *  the Open-tab health sweep — never by the country
+     *  menu anymore (v1.26: the menu opens unconditionally). */
+    private data class ForeignVpn(val vpnBit: Boolean, val iface: String?, val hasAddress: Boolean)
+
+    /** v1.24: the foreign-VPN observation — the raw
+     *  TRANSPORT_VPN bit plus the active interface name
+     *  and whether it carries a link address. Read in
+     *  one pass; used by the gate and by its diagnostic
+     *  line. */
+    private fun foreignVpnObservation(): ForeignVpn {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val net = try { cm?.activeNetwork } catch (_: Exception) { null } ?: return ForeignVpn(false, null, false)
+            val caps = try { cm?.getNetworkCapabilities(net) } catch (_: Exception) { null }
+            val bit = caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+            val lp = try { cm?.getLinkProperties(net) } catch (_: Exception) { null }
+            val iface = try { lp?.interfaceName } catch (_: Exception) { null }
+            val hasAddr = try { lp?.linkAddresses?.isNotEmpty() == true } catch (_: Exception) { false }
+            ForeignVpn(bit, iface, hasAddr)
+        } catch (_: Exception) { ForeignVpn(false, null, false) }
+    }
+
+    /** v1.24: a foreign VPN counts as up ONLY on a real
+     *  tunnel interface (tun/ppp/tap) with a link
+     *  address — a bare TRANSPORT_VPN bit on a wlan/rmnet
+     *  interface (the phantom) is ignored. */
+    private fun foreignVpnUp(): Boolean {
+        val o = foreignVpnObservation()
+        if (!o.vpnBit) return false
+        val low = try { o.iface?.lowercase() } catch (_: Exception) { null } ?: return false
+        if (!(low.startsWith("tun") || low.startsWith("ppp") || low.startsWith("tap"))) return false
+        return o.hasAddress
+    }
+
     private fun anyVpnUp(): Boolean {
         return try {
             if (OvpnEngine.isConnected || OvpnEngine.isConnecting) return true
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            val caps = try { cm?.getNetworkCapabilities(cm.activeNetwork) } catch (_: Exception) { null }
-            caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+            foreignVpnUp()
         } catch (_: Exception) { false }
     }
 
@@ -2748,7 +3546,8 @@ class OpenVpnActivity : Activity() {
         } catch (_: Exception) { 2 }
     }
 
-    /** Local dot verdict for one profile: green if ANY remote
+    /** Local probe verdict (health sweep only — the card
+     *  dots are gone in 1.42) for one profile: green if ANY remote
      *  answers; else red if any is definitively dead/closed/
      *  unresolvable; else grey. */
     private fun dotLocalResult(text: String): Pair<Int, String> {

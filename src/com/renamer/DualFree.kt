@@ -3,175 +3,365 @@ package com.renamer
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Dual free-account creation (v1.1). One tap starts
- * TWO background creations in parallel (two temp
- * mails, two signups, two verifications — the same
- * TbAutoAccount flow, provider rotation intact).
- * Whichever account verifies first becomes the
- * ACTIVE account; the other becomes the BACKUP.
- * The waiting screen covers creation until the
- * first account is ready; the second continues
- * silently and never bothers the user.
- * If the backup job fails, it retries silently up
- * to 3 attempts. A resting account whose 31-day
- * window has passed is reused as the backup
- * instead of creating a new one. If BOTH jobs fail,
- * the caller shows the failure dialog (with retry)
- * — the only visible failure path.
+ * Dual free accounts (v1.1) — creation model v1.10.
+ *
+ * One tap used to start TWO parallel creations (v1.1–v1.9). That
+ * sent two signups from the same VPN exit IP within seconds — the
+ * exact pattern the site's "an account was already created from
+ * this device" limit trips on — and the waiting screen waited for
+ * BOTH jobs (the v1.9 10-minute hang). v1.10:
+ * - FOREGROUND: ONE creation only (createSingle). The waiting
+ *   screen covers just this job (global deadline 130 s).
+ * - BACKUP: when the first account is ready AND the user's VPN
+ *   is up, a second account is created silently in the background
+ *   (createBackupSilently — no screen, no popup, no progress).
+ *   If it was not created (VPN off, or the attempt failed), the
+ *   NEXT app open builds it silently instead — only while a VPN
+ *   is up, else skip quietly and try a later open.
+ * - Afterwards the dual behaviour is unchanged: first = active,
+ *   second = backup; failover promotes the backup + silently
+ *   creates a fresh backup; a rested account past 31 days is
+ *   reused as the backup.
+ *
+ * LIFECYCLE (v1.10): the foreground creation is owned by the
+ * APPLICATION, not the Activity. Minimizing must not stop it:
+ * the job runs on plain worker threads with the application
+ * context (no Activity reference anywhere in the creation path);
+ * a foreground service (TbCreationService) holds the process
+ * alive while it runs — with no foreground component the system
+ * (and aggressive OEM killers) may reclaim the process within
+ * seconds of backgrounding, which is what stopped creation on
+ * minimize; and the live progress + terminal result live in this
+ * object's state, so a recreated Activity re-attaches on resume
+ * and the waiting dialog shows real progress again. Nothing here
+ * is ever cancelled by onPause/onStop — only the user (لغو) or
+ * the 130 s deadline ends it. (The Activity has no onStop at all;
+ * onPause only ends the guide + removes the status poller.)
  */
 object DualFree {
 
-    interface DualCallback {
+    /** v1.10: the foreground creation's live listener. One listener
+     *  at a time (the visible Activity); the job itself never holds
+     *  an Activity — progress and the result also live in the
+     *  object state below, so a recreated Activity re-attaches. */
+    interface SingleCallback {
         fun onProgress(pct: Int, secondsLeft: Int)
-        fun onFirstReady()
-        fun onBackupReady()
-        fun onBothFailed(fa: String, en: String)
+        fun onStage(fa: String, en: String, ru: String, index: Int)
+        fun onReady()
+        fun onFailed(fa: String, en: String, ru: String)
     }
 
-    fun createDual(ctx: Context, cb: DualCallback) {
+    /** v1.9: a running creation. cancel() stops the job and the
+     *  global deadline; the screen is dismissed by the caller.
+     *  No callback fires after a cancel. */
+    class CreationJob internal constructor(private val onCancel: () -> Unit) {
+        fun cancel() { try { onCancel() } catch (_: Exception) {} }
+    }
+
+    /** Terminal result of the single creation (the Activity
+     *  consumes it once via consumeSingleOutcome). */
+    class SingleOutcome(val ok: Boolean, val fa: String = "", val en: String = "", val ru: String = "")
+
+    /** v1.11: the global deadline — 130 s, DELIBERATELY longer
+     *  than the job's own 120 s watchdog (TbAutoAccount), so the
+     *  job normally settles first with its SPECIFIC outcome and
+     *  this backstop almost never fires. When it does fire, it
+     *  surfaces the job's last recorded failure (or the stage it
+     *  stalled in) — never the generic timeout text alone.
+     *  (v1.10's 110 s deadline always pre-empted the job: the
+     *  user only ever saw the generic "took too long" message.) */
+    private const val GLOBAL_DEADLINE_MS = 130_000L
+
+    // ---------- v1.10: application-scoped single-creation state ----------
+    // The Activity may be destroyed while the creation runs (minimize
+    // + system reclaim, rotation). The job, its last progress and its
+    // terminal result live here so the next Activity instance
+    // re-attaches on resume instead of starting over. All of this is
+    // main-thread only except the @Volatile reads.
+    @Volatile private var singleActive = false
+    @Volatile private var singleCancelled = false
+    @Volatile private var singlePct = 0
+    @Volatile private var singleLeft = 0
+    @Volatile private var singleStageIdx = -1
+    @Volatile private var singleStageText: Triple<String, String, String>? = null
+    @Volatile private var singleStartedAtMs = 0L
+    @Volatile private var singleAppCtx: Context? = null
+    @Volatile private var singleOutcome: SingleOutcome? = null
+    @Volatile private var singleOutcomeHandled = false
+    @Volatile private var singleListener: SingleCallback? = null
+    @Volatile private var singleTeardown: (() -> Unit)? = null
+
+    fun isSingleActive(): Boolean = singleActive
+    fun singleStartedAtMs(): Long = singleStartedAtMs
+    /** Last live values for a re-attaching Activity: pct, seconds-left, stage index. */
+    fun singleProgress(): Triple<Int, Int, Int> = Triple(singlePct, singleLeft, singleStageIdx)
+    fun singleStageText(): Triple<String, String, String>? = singleStageText
+    fun setSingleListener(cb: SingleCallback?) { try { singleListener = cb } catch (_: Exception) {} }
+
+    /** Atomically claim the terminal result for handling; false when
+     *  there is none or it was already claimed. The live listener
+     *  and the re-attach path race on the main thread — exactly one
+     *  wins, so the outcome is never handled twice. */
+    fun tryClaimSingleOutcome(): Boolean {
+        synchronized(this) {
+            if (singleOutcome == null || singleOutcomeHandled) return false
+            singleOutcomeHandled = true
+            return true
+        }
+    }
+
+    /** Take the terminal result exactly once (null when still
+     *  running or already handled). The Activity calls this on
+     *  resume when it finds no live job. */
+    fun consumeSingleOutcome(): SingleOutcome? {
+        synchronized(this) {
+            val o = singleOutcome ?: return null
+            if (singleOutcomeHandled) return null
+            singleOutcomeHandled = true
+            singleOutcome = null
+            return o
+        }
+    }
+
+    private fun clearSingleState() {
+        singleActive = false
+        singlePct = 0
+        singleLeft = 0
+        singleStageIdx = -1
+        singleStageText = null
+        singleStartedAtMs = 0L
+        singleAppCtx = null
+        singleOutcome = null
+        singleOutcomeHandled = false
+        singleListener = null
+        singleTeardown = null
+        // NOTE: singleCancelled is NOT reset here — a late posted
+        // callback must still see the cancel. It is reset only at
+        // the start of the next createSingle (main thread, before
+        // any callback can run).
+    }
+
+    /** v1.10: the keeper service — started when a foreground
+     *  creation begins, stopped the moment it settles. If starting
+     *  it fails (background-start restriction), the creation still
+     *  runs on its threads; only the process-lifetime protection
+     *  is lost, never the creation itself. */
+    private fun startCreationService(ctx: Context) {
+        try {
+            val intent = android.content.Intent(ctx, TbCreationService::class.java)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                ctx.startForegroundService(intent)
+            } else {
+                ctx.startService(intent)
+            }
+        } catch (_: Exception) {
+            // v1.10: creation-method traces go to logcat only,
+            // never to the in-app log (user order).
+            try { android.util.Log.d("DualFree", "Keeper service did not start (creation continues)") } catch (_: Exception) {}
+        }
+    }
+
+    private fun stopCreationService(ctx: Context?) {
+        if (ctx == null) return
+        try { ctx.stopService(android.content.Intent(ctx, TbCreationService::class.java)) } catch (_: Exception) {}
+    }
+
+    /** v1.10: create the FIRST (and only) foreground account. One
+     *  job, one temp mail, one signup, one verification — provider
+     *  rotation intact, global deadline 130 s. The waiting screen
+     *  covers just this job; the backup comes later, silently. */
+    fun createSingle(ctx: Context): CreationJob {
         val appCtx = ctx.applicationContext
         val main = Handler(Looper.getMainLooper())
-        val startMs = System.currentTimeMillis()
         val country = TunnelBear.selectedCountry(appCtx)
-        val lock = Any()
-        var progressA = 0
-        var progressB = 0
-        var settledA = false
-        var settledB = false
-        var firstReadyFired = false
-        var lastFail: Pair<String, String>? = null
+        var settled = false
+        var timeoutFired = false
+        var job: TbAutoAccount.JobHandle? = null
+        var timeoutRunnable: Runnable? = null
 
-        fun secondsLeft(): Int {
-            val elapsed = ((System.currentTimeMillis() - startMs) / 1000).toInt()
-            return maxOf(3, 75 - elapsed)
+        // Register the application-scoped state BEFORE the job
+        // starts, so an Activity recreated a second later
+        // re-attaches instead of starting over.
+        singleCancelled = false
+        singleActive = true
+        singlePct = 0
+        singleLeft = 0
+        singleStageIdx = -1
+        singleStageText = null
+        singleStartedAtMs = System.currentTimeMillis()
+        singleAppCtx = appCtx
+        singleOutcome = null
+        singleOutcomeHandled = false
+        startCreationService(appCtx)
+
+        // v1.8: ONE displayed value, MONOTONIC — it never goes
+        // backwards. (With one job the clamp is trivially true,
+        // but the seconds-left is still derived from this single
+        // percentage + the EMA total for one clean attempt, so the
+        // countdown always agrees with the bar and never jumps up
+        // on a retry. During a provider retry the numbers FREEZE —
+        // they cannot go backwards, so they wait for real progress;
+        // the dots keep moving.)
+        var shownPct = 0
+        val totalMs = TbAutoAccount.estimatedTotalMs(appCtx).coerceAtLeast(10_000L)
+        fun reportProgress(pct: Int) {
+            if (singleCancelled) return
+            val p = pct.coerceIn(0, 100)
+            if (p > shownPct) shownPct = p
+            singlePct = shownPct
+            singleLeft = maxOf(5, ((100 - shownPct) * totalMs / 100 / 1000).toInt())
+            val s = shownPct
+            val l = singleLeft
+            main.post { try { singleListener?.onProgress(s, l) } catch (_: Exception) {} }
         }
-        fun reportProgress() {
-            val pct = (progressA + progressB) / 2
-            val left = secondsLeft()
-            main.post { try { cb.onProgress(pct, left) } catch (_: Exception) {} }
+        fun reportStage(fa: String, en: String, ru: String, index: Int) {
+            if (singleCancelled) return
+            singleStageIdx = index
+            singleStageText = Triple(fa, en, ru)
+            main.post { try { singleListener?.onStage(fa, en, ru, index) } catch (_: Exception) {} }
         }
-        fun maybeFirstReady() {
-            synchronized(lock) {
-                if (firstReadyFired) return
-                val active = FreeAccounts.active(appCtx)
-                if (active != null) {
-                    firstReadyFired = true
-                    main.post { try { cb.onFirstReady() } catch (_: Exception) {} }
-                    return
-                }
-                // No active yet, but a backup exists (the
-                // primary job failed while the other one
-                // succeeded): promote it so the user still
-                // gets a working account.
-                val bk = FreeAccounts.backup(appCtx)
-                if (bk != null && settledA && settledB) {
-                    try { FreeAccounts.promoteBackup(appCtx) } catch (_: Exception) {}
-                    if (FreeAccounts.active(appCtx) != null) {
-                        firstReadyFired = true
-                        main.post { try { cb.onFirstReady() } catch (_: Exception) {} }
-                    }
-                }
-            }
-        }
-        fun checkBothFailed() {
-            synchronized(lock) {
-                if (!settledA || !settledB) return
-                if (FreeAccounts.active(appCtx) == null && !firstReadyFired) {
-                    val f = lastFail ?: ("ساخت حساب ناموفق بود. دوباره تلاش کن." to
-                        "Account creation failed. Try again.")
-                    main.post { try { cb.onBothFailed(f.first, f.second) } catch (_: Exception) {} }
+        fun settle(ok: Boolean, fa: String = "", en: String = "", ru: String = "") {
+            if (singleCancelled) return
+            synchronized(this) {
+                if (settled || singleCancelled) return
+                settled = true
+                try { timeoutRunnable?.let { main.removeCallbacks(it) } } catch (_: Exception) {}
+                singleOutcome = SingleOutcome(ok, fa, en, ru)
+                singleActive = false
+                stopCreationService(appCtx)
+                val o = singleOutcome!!
+                val listener = singleListener
+                singleListener = null
+                main.post {
+                    try {
+                        if (o.ok) listener?.onReady()
+                        else listener?.onFailed(o.fa, o.en, o.ru)
+                    } catch (_: Exception) {}
                 }
             }
         }
 
         val saveHook: (String, String) -> Unit = { email, password ->
-            synchronized(lock) {
-                if (FreeAccounts.active(appCtx) == null) {
-                    FreeAccounts.add(appCtx, email, password, country, asActive = true)
-                    maybeFirstReady()
-                } else {
-                    FreeAccounts.add(appCtx, email, password, country, asActive = false)
-                    main.post { try { cb.onBackupReady() } catch (_: Exception) {} }
-                }
-                try { TunnelBear.ensureSingleEntry(appCtx, restoreDeleted = true) } catch (_: Exception) {}
+            if (FreeAccounts.active(appCtx) == null) {
+                FreeAccounts.add(appCtx, email, password, country, asActive = true)
             }
+            try { TunnelBear.ensureSingleEntry(appCtx, restoreDeleted = true) } catch (_: Exception) {}
         }
 
-        // Slot B: the backup job. Reuse a rested
-        // account when one is eligible; otherwise
-        // create one, retrying silently up to 3 times.
-        var backupJobStarted = false
-        fun runBackupJob(attempt: Int) {
-            backupJobStarted = true
-            TbAutoAccount.start(appCtx, object : TbAutoAccount.Callback {
-                override fun onProgress(pct: Int, secondsLeft: Int) {
-                    progressB = pct.coerceIn(0, 99)
-                    reportProgress()
-                }
-                override fun onSuccess() {
-                    progressB = 100
-                    synchronized(lock) { settledB = true }
-                    reportProgress()
-                    maybeFirstReady()
-                }
-                override fun onFailure(fa: String, en: String) {
-                    if (attempt < 3) {
-                        runBackupJob(attempt + 1)
+        // v1.11: the global deadline is only a BACKSTOP now (130 s,
+        // longer than the job's own 120 s watchdog, so the job's
+        // specific outcome normally wins). If it ever fires, it
+        // must NOT hide the real reason behind the generic timeout
+        // text (v1.10's 110 s deadline always pre-empted the job —
+        // that is why the user only ever saw "took too long").
+        // So: cancel the job, then read its last recorded failure
+        // (device-limit first) and show THAT; when no attempt ever
+        // finished, name the stage it stalled in.
+        timeoutRunnable = Runnable {
+            if (singleCancelled) return@Runnable
+            synchronized(this) {
+                if (timeoutFired || settled || singleCancelled) return@Runnable
+                timeoutFired = true
+                try { job?.cancel() } catch (_: Exception) {}
+                val specific = try { job?.lastFailure() } catch (_: Exception) { null }
+                if (specific != null) {
+                    settle(false, specific.first, specific.second, specific.third)
+                } else {
+                    val st = try { job?.lastStageText() } catch (_: Exception) { null }
+                    if (st != null) {
+                        settle(false,
+                            "ساخت حساب خیلی طول کشید (بیشتر از ۲ دقیقه) — در مرحله‌ی «${st.first}» متوقف شد. دوباره تلاش کن.",
+                            "Account creation took too long (over 2 minutes) — it stalled at the “${st.second}” stage. Try again.",
+                            "Создание аккаунта заняло слишком много времени (больше 2 минут) — остановка на этапе «${st.third}». Попробуйте снова.")
                     } else {
-                        lastFail = fa to en
-                        synchronized(lock) { settledB = true }
-                        checkBothFailed()
+                        settle(false,
+                            "ساخت حساب خیلی طول کشید (بیشتر از ۲ دقیقه). دوباره تلاش کن.",
+                            "Account creation took too long (over 2 minutes). Try again.",
+                            "Создание аккаунта заняло слишком много времени (больше 2 минут). Попробуйте снова.")
                     }
                 }
-            }, saveHook)
+            }
         }
+        timeoutRunnable?.let { main.postDelayed(it, GLOBAL_DEADLINE_MS) }
 
-        val reused = try { FreeAccounts.reuseRestingAsBackup(appCtx, country) } catch (_: Exception) { null }
-        if (reused != null) {
-            progressB = 100
-            settledB = true
-            main.post { try { cb.onBackupReady() } catch (_: Exception) {} }
-        }
-
-        // Slot A: the primary job (one attempt — the
-        // backup job carries the silent retries).
-        TbAutoAccount.start(appCtx, object : TbAutoAccount.Callback {
+        job = TbAutoAccount.start(appCtx, object : TbAutoAccount.Callback {
             override fun onProgress(pct: Int, secondsLeft: Int) {
-                progressA = pct.coerceIn(0, 99)
-                reportProgress()
+                reportProgress(pct)
+            }
+            override fun onStage(fa: String, en: String, ru: String, index: Int) {
+                reportStage(fa, en, ru, index)
             }
             override fun onSuccess() {
-                progressA = 100
-                synchronized(lock) { settledA = true }
-                reportProgress()
-                maybeFirstReady()
+                reportProgress(100)
+                settle(true)
             }
-            override fun onFailure(fa: String, en: String) {
-                lastFail = fa to en
-                synchronized(lock) { settledA = true }
-                maybeFirstReady()
-                checkBothFailed()
+            override fun onFailure(fa: String, en: String, ru: String) {
+                settle(false, fa, en, ru)
             }
         }, saveHook)
+        singleTeardown = {
+            try { timeoutRunnable?.let { main.removeCallbacks(it) } } catch (_: Exception) {}
+            try { job?.cancel() } catch (_: Exception) {}
+        }
 
-        if (!backupJobStarted && reused == null) runBackupJob(1)
-        reportProgress()
+        return CreationJob { cancelSingle() }
     }
 
-    /** Create a fresh backup silently (failover
-     *  follow-up): reuse a rested account when
-     *  eligible, else create one with up to 3
-     *  silent attempts. Never shows anything. */
+    /** Cancel a live single creation (the waiting screen's «لغو»).
+     *  A no-op when nothing is running — in particular it never
+     *  wipes an unconsumed terminal result: after settle, the
+     *  outcome stays for the re-attach path. The job's callbacks
+     *  are suppressed after a cancel, so no screen follows. */
+    fun cancelSingle() {
+        synchronized(this) {
+            if (!singleActive) return
+            singleActive = false
+            singleCancelled = true
+        }
+        try { singleTeardown?.invoke() } catch (_: Exception) {}
+        try { stopCreationService(singleAppCtx) } catch (_: Exception) {}
+        clearSingleState()
+    }
+
+    /** Create a fresh backup silently (failover follow-up, v1.10
+     *  post-first-creation backup, next-open retry): reuse a rested
+     *  account when eligible, else create one with up to 3 silent
+     *  attempts. Never shows anything — no screen, no popup, no
+     *  progress. Logcat only (never the in-app log — v1.10).
+     *  v1.10: lifecycle-proof — a plain daemon thread on the
+     *  application context (no Activity reference); an in-flight
+     *  guard stops overlapping runs (first-ready + app-open +
+     *  failover can all ask at once). If the process dies
+     *  mid-backup, the next app open retries — by design, the
+     *  backup is best-effort and the first account is never
+     *  touched. */
+    private val backupInFlight = AtomicBoolean(false)
+
     fun createBackupSilently(ctx: Context) {
         val appCtx = ctx.applicationContext
+        if (!backupInFlight.compareAndSet(false, true)) return
         Thread {
             try {
                 if (FreeAccounts.backup(appCtx) != null) return@Thread
                 val country = TunnelBear.selectedCountry(appCtx)
                 val reused = try { FreeAccounts.reuseRestingAsBackup(appCtx, country) } catch (_: Exception) { null }
-                if (reused != null) return@Thread
+                if (reused != null) {
+                    try { android.util.Log.d("DualFree", "Backup account restored from a rested account") } catch (_: Exception) {}
+                    return@Thread
+                }
+                try { android.util.Log.d("DualFree", "Silent background backup creation started") } catch (_: Exception) {}
+                // v1.13: exit-IP awareness — do NOT burn a silent
+                // creation on an exit IP that already refused with
+                // the device limit. The next app open (or the
+                // exit-change check in the Activity) retries when
+                // the exit IP changes to an unseen one.
+                if (!TbAutoAccount.exitIpAllowsRetry(appCtx)) {
+                    try { android.util.Log.d("DualFree", "Silent backup skipped — current exit IP already refused (device limit)") } catch (_: Exception) {}
+                    return@Thread
+                }
                 var attempt = 0
                 while (attempt < 3 && FreeAccounts.backup(appCtx) == null) {
                     attempt++
@@ -179,14 +369,24 @@ object DualFree {
                     var ok = false
                     TbAutoAccount.start(appCtx, object : TbAutoAccount.Callback {
                         override fun onSuccess() { ok = true; done.countDown() }
-                        override fun onFailure(fa: String, en: String) { done.countDown() }
-                    }) { email, password ->
+                        override fun onFailure(fa: String, en: String, ru: String) { done.countDown() }
+                    }, saveHook = { email, password ->
                         try { FreeAccounts.add(appCtx, email, password, country, asActive = false) } catch (_: Exception) {}
-                    }
+                    }, startProviderIndex = 1)
                     try { done.await(6, java.util.concurrent.TimeUnit.MINUTES) } catch (_: Exception) {}
                     if (ok) break
                 }
-            } catch (_: Exception) {}
+                try {
+                    if (FreeAccounts.backup(appCtx) != null) {
+                        android.util.Log.d("DualFree", "Silent background backup account created")
+                    } else {
+                        android.util.Log.d("DualFree", "Silent background backup creation failed; will retry on the next app open")
+                    }
+                } catch (_: Exception) {}
+            } catch (_: Exception) {
+            } finally {
+                backupInFlight.set(false)
+            }
         }.apply { isDaemon = true }.start()
     }
 }

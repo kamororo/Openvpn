@@ -83,8 +83,52 @@ object TunnelBear {
 
     /** The single stored TunnelBear entry's name. */
     const val SINGLE_NAME = "TunnelBear"
-    /** Fallback country when the user never picked one. */
     const val DEFAULT_COUNTRY = "Germany"
+
+    /** v1.13: the SMART CONNECT sentinel — stored as
+     *  tb_country when the user picks «اتصال هوشمند»
+     *  in the country menu. It is a VALID selection
+     *  (not a country, never probed, never re-sorted),
+     *  and the app picks the best location itself at
+     *  connect time (green by measured throughput,
+     *  else best handshake). */
+    const val SMART = "SMART"
+    private const val KEY_SMART_CHOICE = "tb_smart_choice"
+
+    /** True when the stored selection is Smart Connect. */
+    fun isSmartSelection(ctx: Context): Boolean {
+        return try {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_COUNTRY, null) == SMART
+        } catch (_: Exception) { false }
+    }
+
+    /** The raw stored selection (a country, SMART, or null). */
+    fun rawSelection(ctx: Context): String? {
+        return try {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_COUNTRY, null)?.takeIf { it.isNotBlank() }
+        } catch (_: Exception) { null }
+    }
+
+    /** The country Smart Connect last picked (persisted),
+     *  or null when it never picked one yet. */
+    fun smartChoice(ctx: Context): String? {
+        return try {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_SMART_CHOICE, null)?.takeIf { isKnownCountry(ctx, it) }
+        } catch (_: Exception) { null }
+    }
+
+    /** Remember the country Smart Connect picked, so the
+     *  single entry can be built for it and the chip can
+     *  show it while connected. */
+    fun saveSmartChoice(ctx: Context, country: String) {
+        try {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putString(KEY_SMART_CHOICE, country).apply()
+        } catch (_: Exception) {}
+    }
 
     /** 3.06: the ONLY user-visible name for the
      *  single entry — the stored name ("TunnelBear")
@@ -111,10 +155,10 @@ object TunnelBear {
     /** 3.06: per-country TLS-probe cache (host ->
      *  "code|millis", TTL 10 min) and per-country
      *  REAL-dial outcomes (last 7 days only). */
-    private const val KEY_PROBE = "tb_probe_"
     private const val KEY_DIAL_OK = "tb_dial_ok_"
     private const val KEY_DIAL_TIME = "tb_dial_time_"
-    const val PROBE_TTL_MS = 10 * 60 * 1000L
+
+
     const val DIAL_WINDOW_MS = 7L * 24 * 60 * 60 * 1000
     private const val KEY_COUNTRY = "tb_country"
     private const val KEY_REMOVED = "tb_removed"
@@ -177,12 +221,22 @@ object TunnelBear {
     }
 
     /** "TunnelBear Germany.ovpn" -> "Germany";
-     *  "TunnelBear Latvia.ovpn.txt" -> "Latvia". */
+     *  "TunnelBear Latvia.ovpn.txt" -> "Latvia".
+     *  v1.22: strip BOTH suffixes in a loop — the old
+     *  order removed ".ovpn" before ".txt", so
+     *  "Latvia.ovpn.txt" came out as "Latvia.ovpn" and
+     *  the menu showed the raw filename. */
     fun countryName(fileName: String): String {
         var n = fileName
         if (n.startsWith("TunnelBear ", ignoreCase = true)) n = n.substring("TunnelBear ".length)
-        n = n.removeSuffix(".ovpn").removeSuffix(".OVPN")
-        n = n.removeSuffix(".txt").removeSuffix(".TXT")
+        while (true) {
+            val lower = n.lowercase()
+            when {
+                lower.endsWith(".ovpn") -> n = n.dropLast(5)
+                lower.endsWith(".txt") -> n = n.dropLast(4)
+                else -> break
+            }
+        }
         return n.trim()
     }
 
@@ -258,11 +312,15 @@ object TunnelBear {
         } catch (_: Exception) { null }
     }
 
-    /** The user's picked country, persisted. */
+    /** The user's picked country, persisted. When Smart
+     *  Connect is selected, this is the country it last
+     *  picked (or the default until it picks one), so the
+     *  single entry is always built for a real country. */
     fun selectedCountry(ctx: Context): String {
         return try {
-            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getString(KEY_COUNTRY, null)?.takeIf { it.isNotBlank() } ?: DEFAULT_COUNTRY
+            val stored = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_COUNTRY, null)?.takeIf { it.isNotBlank() } ?: return DEFAULT_COUNTRY
+            if (stored == SMART) smartChoice(ctx) ?: DEFAULT_COUNTRY else stored
         } catch (_: Exception) { DEFAULT_COUNTRY }
     }
 
@@ -287,7 +345,8 @@ object TunnelBear {
         return try {
             val stored = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .getString(KEY_COUNTRY, null)
-            stored?.isNotBlank() == true && isKnownCountry(ctx, stored)
+            // v1.13: SMART is a valid selection too.
+            stored == SMART || (stored?.isNotBlank() == true && isKnownCountry(ctx, stored))
         } catch (_: Exception) { false }
     }
 
@@ -295,6 +354,33 @@ object TunnelBear {
         try {
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putString(KEY_COUNTRY, country).apply()
+        } catch (_: Exception) {}
+    }
+
+    /** v1.7: the «راهنمای اتصال» tutorial stays until the
+     *  user's FIRST free-tunnel connection, then vanishes
+     *  for good. Set the moment the free tunnel first
+     *  reaches CONNECTED (the activity's poller watches
+     *  for it). Upgrade seed: a user who already
+     *  connected before v1.7 (a successful free dial
+     *  recorded in the last 7 days for any country)
+     *  counts as already-guided, so the button does
+     *  not reappear for them after the update. */
+    private const val KEY_FIRST_FREE_CONNECTED = "ovpn_first_free_connected"
+
+    fun hasFirstFreeConnection(ctx: Context): Boolean {
+        return try {
+            val sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (sp.getBoolean(KEY_FIRST_FREE_CONNECTED, false)) return true
+            // Upgrade seed — a past successful free dial.
+            countries(ctx).any { dialOutcome(ctx, it) == 1 }
+        } catch (_: Exception) { false }
+    }
+
+    fun markFirstFreeConnection(ctx: Context) {
+        try {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putBoolean(KEY_FIRST_FREE_CONNECTED, true).apply()
         } catch (_: Exception) {}
     }
 
@@ -355,7 +441,9 @@ object TunnelBear {
             // with no reinstall. Only real 47-list
             // countries survive.
             val storedCountry = sp.getString(KEY_COUNTRY, null)
-            if (storedCountry != null && !isKnownCountry(ctx, storedCountry)) {
+            // v1.13: SMART is a valid stored selection —
+            // never healed away.
+            if (storedCountry != null && storedCountry != SMART && !isKnownCountry(ctx, storedCountry)) {
                 sp.edit().remove(KEY_COUNTRY).apply()
             }
             // Upgrade adoption: no country picked yet —
@@ -655,65 +743,8 @@ object TunnelBear {
         } catch (_: Exception) { null }
     }
 
-    /** 3.06: the LIGHT per-country probe for the
-     *  country list — the same TLS-handshake probe
-     *  as probeTls (reset + ClientHello, waiting
-     *  for the server's certificate flight or a
-     *  TLS alert), against the country's own
-     *  hostname, in parallel over its resolved
-     *  IPs (at most 6). Returns 2 when >=1 IP
-     *  returns a TLS flight/alert (healthy),
-     *  1 when >=1 IP answers TCP but no TLS
-     *  flight, 0 when nothing answers. Plain
-     *  sockets only — never touches the VPN.
-     *  Background threads only. */
-    fun probeCountryHealth(ctx: Context, host: String): Int {
-        val fresh = try {
-            InetAddress.getAllByName(host)
-                .filterIsInstance<java.net.Inet4Address>()
-                .mapNotNull { it.hostAddress }
-        } catch (_: Exception) { emptyList() }
-        val ordered = (fresh + healthyIps(ctx, host)).distinct().take(6)
-        if (ordered.isEmpty()) return 0
-        val best = java.util.concurrent.atomic.AtomicInteger(0)
-        val pool = java.util.concurrent.Executors.newFixedThreadPool(ordered.size.coerceAtMost(6))
-        val done = java.util.concurrent.CountDownLatch(ordered.size)
-        for (ip in ordered) {
-            pool.submit {
-                try {
-                    val r = probeTls(ip)
-                    while (true) {
-                        val cur = best.get()
-                        if (r <= cur || best.compareAndSet(cur, r)) break
-                    }
-                } catch (_: Exception) {} finally { done.countDown() }
-            }
-        }
-        try { done.await(9500, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Exception) {}
-        try { pool.shutdownNow() } catch (_: Exception) {}
-        return best.get()
-    }
 
-    /** Cached probe result for a host (2/1/0),
-     *  or null when unknown/stale (>10 min). */
-    fun cachedProbe(ctx: Context, host: String): Int? {
-        return try {
-            val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getString(KEY_PROBE + host.lowercase(), null) ?: return null
-            val parts = raw.split("|")
-            if (parts.size != 2) return null
-            val code = parts[0].toIntOrNull() ?: return null
-            val at = parts[1].toLongOrNull() ?: return null
-            if (System.currentTimeMillis() - at > PROBE_TTL_MS) null else code
-        } catch (_: Exception) { null }
-    }
 
-    fun storeProbe(ctx: Context, host: String, code: Int) {
-        try {
-            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .putString(KEY_PROBE + host.lowercase(), "$code|${System.currentTimeMillis()}").apply()
-        } catch (_: Exception) {}
-    }
 
     /** 3.06: record a REAL dial outcome for one
      *  country (called from OpenVpnActivity's
@@ -741,83 +772,29 @@ object TunnelBear {
         } catch (_: Exception) { 0 }
     }
 
-    // ---------- 3.07: session probe per country ----------
+    // ---------- v1.26: pins — the user pins the countries
+    // he managed to connect to himself. No testing: a pin
+    // is the user's own mark, stored as a string set.
+    private const val KEY_PINNED = "ovpn_pinned_countries"
 
-    /** Session-probe cache (host -> "tls|session|millis|ip|detail",
-     *  TTL 10 min, same as the TLS-probe cache). Never the dial keys. */
-    private const val KEY_SESSION = "tb_session_"
-
-    /** 3.07: the full session probe for one country's host — TLS
-     *  flight + AUTH with the saved account + PUSH_REPLY, over TCP
-     *  7011 with the relay-style split write (the same transport the
-     *  connect path uses). The CA comes from the stored free entry's
-     *  inlined <ca> block when there is one. No account yet means
-     *  no credentials, so the probe stops after the TLS flight
-     *  (session 0, "no_creds"). Never logs credentials. */
-    fun probeCountrySession(ctx: Context, host: String): OvpnSessionProbe.SessionVerdict {
-        val account = getAccount(ctx)
-        val caPem = try {
-            OvpnStore.load(ctx).firstOrNull { it.tunnelBear }
-                ?.let { OvpnSessionProbe.extractBlock(it.ovpn, "ca") }
-        } catch (_: Exception) { null }
-        val ips = try {
-            InetAddress.getAllByName(host)
-                .filterIsInstance<java.net.Inet4Address>()
-                .mapNotNull { it.hostAddress }
-        } catch (_: Exception) { emptyList() }
-        val ordered = (ips + healthyIps(ctx, host)).distinct().take(2)
-        if (ordered.isEmpty()) return OvpnSessionProbe.SessionVerdict(0, 0, null, "unresolved")
-        val user = account?.first ?: ""
-        val pass = account?.second ?: ""
-        for (ip in ordered) {
-            val v = OvpnSessionProbe.probeTcp(ip, TCP_PORT, user, pass,
-                needsAuth = true, caPem = caPem, certPem = null, keyPem = null,
-                cipher = "AES-256-CBC", auth = "SHA256",
-                splitWrite = true, deadlineMs = 9000)
-            if (v.tls >= 1) {
-                storeSession(ctx, host, v)
-                storeProbe(ctx, host, v.tls)
-                return v
-            }
-        }
-        val v = OvpnSessionProbe.SessionVerdict(0, 0, null, "tcp_dead")
-        storeSession(ctx, host, v)
-        storeProbe(ctx, host, 0)
-        return v
+    fun pinnedCountries(ctx: Context): Set<String> {
+        return try {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getStringSet(KEY_PINNED, null)?.toSet() ?: emptySet()
+        } catch (_: Exception) { emptySet() }
     }
 
-    fun storeSession(ctx: Context, host: String, v: OvpnSessionProbe.SessionVerdict) {
+    fun isPinned(ctx: Context, country: String): Boolean {
+        return try { pinnedCountries(ctx).contains(country) } catch (_: Exception) { false }
+    }
+
+    fun setPinned(ctx: Context, country: String, pinned: Boolean) {
         try {
+            val cur = pinnedCountries(ctx).toMutableSet()
+            if (pinned) cur.add(country) else cur.remove(country)
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .putString(KEY_SESSION + host.lowercase(),
-                    "${v.tls}|${v.session}|${System.currentTimeMillis()}|${v.assignedIp ?: ""}|${v.detail}")
-                .apply()
+                .putStringSet(KEY_PINNED, cur).apply()
         } catch (_: Exception) {}
     }
 
-    /** Cached session verdict for a host, or null when never probed or
-     *  older than the 10-minute TTL. */
-    fun cachedSession(ctx: Context, host: String): OvpnSessionProbe.SessionVerdict? {
-        return try {
-            val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getString(KEY_SESSION + host.lowercase(), null) ?: return null
-            val parts = raw.split("|")
-            if (parts.size < 3) return null
-            val tls = parts[0].toIntOrNull() ?: return null
-            val session = parts[1].toIntOrNull() ?: return null
-            val at = parts[2].toLongOrNull() ?: return null
-            if (System.currentTimeMillis() - at > PROBE_TTL_MS) return null
-            OvpnSessionProbe.SessionVerdict(tls, session,
-                parts.getOrNull(3)?.takeIf { it.isNotBlank() },
-                parts.getOrNull(4) ?: "")
-        } catch (_: Exception) { null }
-    }
-
-    /** A country's session outcome from the cache: 1 = a session was
-     *  proven (AUTH + PUSH_REPLY with an IP), -1 = the session failed
-     *  (AUTH_FAILED / no PUSH), 0 = untested or TLS-only. */
-    fun sessionOutcome(ctx: Context, host: String): Int {
-        val v = cachedSession(ctx, host) ?: return 0
-        return v.session
-    }
 }

@@ -38,15 +38,27 @@ import kotlin.concurrent.thread
  * app's own code — no MLM file is copied.
  */
 class TunnelBearRelay(
-    private val service: VpnService,
+    /** The VpnService that owns this relay, or null
+     *  for a probe relay (the probe runs with no VPN
+     *  up, so there is nothing to bypass — the socket
+     *  is used as-is). */
+    private val service: VpnService?,
     /** Candidate server IPs, answering ones first. */
     private val hosts: List<String>,
     private val port: Int = TunnelBear.TCP_PORT,
+    /** Upstream TCP connect timeout in ms. <= 0 keeps
+     *  the old behaviour (4s with several hosts, 8s
+     *  with one). A probe relay passes 3000 so a dead
+     *  IP fails fast instead of burning the probe's
+     *  whole 8s deadline. */
+    private val upstreamConnectMs: Int = -1,
     /** The relay's own upstream sockets must bypass
      *  any VPN that is up: this socket IS the direct
-     *  path. The service's protect() does that. */
+     *  path. The service's protect() does that. With
+     *  no service (probe relay) the socket is used
+     *  as-is. */
     private val protectSocket: (Socket) -> Boolean = { s ->
-        try { service.protect(s) } catch (_: Exception) { false }
+        try { service?.protect(s) ?: true } catch (_: Exception) { false }
     }
 ) {
     init { require(hosts.isNotEmpty()) }
@@ -83,6 +95,12 @@ class TunnelBearRelay(
             // the normal one; lifted once the handshake
             // is through (12 KB down or 20 s).
             val downBytes = java.util.concurrent.atomic.AtomicLong(0)
+            // v1.17: bytes the client actually sent — a
+            // connection that sent nothing (a listening
+            // check, a stray connect) must never rotate
+            // hosts; only a real handshake attempt that
+            // got no flight does.
+            val clientBytes = java.util.concurrent.atomic.AtomicLong(0)
             val clamped = clamp(up, HANDSHAKE_WINDOW)
             if (clamped) thread(name = "tb-relay-unclamp", isDaemon = true) {
                 try {
@@ -94,18 +112,18 @@ class TunnelBearRelay(
             thread(name = "tb-relay-down", isDaemon = true) {
                 try {
                     pump(up.getInputStream(), client.getOutputStream(), downBytes)
-                    if (downBytes.get() < HANDSHAKE_BYTES) skip(host)
+                    if (clientBytes.get() > 0 && downBytes.get() < HANDSHAKE_BYTES) skip(host)
                 } catch (_: Exception) {
                 } finally {
                     runCatching { client.shutdownOutput() }
                 }
             }
-            upSplit(client.getInputStream(), up.getOutputStream())
+            upSplit(client.getInputStream(), up.getOutputStream(), clientBytes)
             // The core gave up on a server that answered
             // at most the reset: the known cut. The next
             // connection goes to another address instead
             // of the same silent one.
-            if (downBytes.get() < HANDSHAKE_BYTES) skip(host)
+            if (clientBytes.get() > 0 && downBytes.get() < HANDSHAKE_BYTES) skip(host)
             runCatching { up.shutdownOutput() }
         } catch (_: Exception) {
             runCatching { client.close() }
@@ -130,7 +148,8 @@ class TunnelBearRelay(
                 protectSocket(socket)
                 socket.connect(
                     InetSocketAddress(InetAddress.getByName(hosts[at]), port),
-                    if (hosts.size > 1) FAILOVER_CONNECT_MS else CONNECT_MS
+                    if (upstreamConnectMs > 0) upstreamConnectMs
+                    else if (hosts.size > 1) FAILOVER_CONNECT_MS else CONNECT_MS
                 )
                 next = at
                 return hosts[at] to socket
@@ -152,8 +171,10 @@ class TunnelBearRelay(
     }
 
     /** Client -> server: the first [SPLIT_BYTES] cut
-     *  up, then a plain copy. */
-    private fun upSplit(input: InputStream, output: OutputStream) {
+     *  up, then a plain copy. [clientBytes] counts the
+     *  bytes the client actually sent (the skip gate). */
+    private fun upSplit(input: InputStream, output: OutputStream,
+        clientBytes: java.util.concurrent.atomic.AtomicLong) {
         val rng = SecureRandom()
         val buf = ByteArray(16 * 1024)
         var budget = SPLIT_BYTES
@@ -168,6 +189,7 @@ class TunnelBearRelay(
         while (true) {
             val n = input.read(buf)
             if (n < 0) return
+            clientBytes.addAndGet(n.toLong())
             var at = 0
             if (resetLeft != 0) {
                 if (resetLeft < 0) {

@@ -332,7 +332,13 @@ object OvpnSessionProbe {
             val app = AppReader(ctl, engine, deadline)
             var sawServerKeyEx = false
             var verdict: SessionVerdict? = null
-            val keyExDeadline = minOf(deadline, System.currentTimeMillis() + 3000)
+            // v1.12: the key exchange gets the FULL remaining
+            // deadline, not a fixed 3s — on a slow line the
+            // server's key exchange can take longer than 3s,
+            // and the old cap called a working location
+            // "no_keyex" (red) when it only needed more time
+            // (item 9 probe check).
+            val keyExDeadline = deadline
             while (System.currentTimeMillis() < keyExDeadline && verdict == null) {
                 val chunk = app.readMore() ?: break
                 val text = app.textSoFar()
@@ -349,7 +355,9 @@ object OvpnSessionProbe {
             }
             // PUSH_REQUEST, then wait for the reply.
             ctl.sendTlsApp(engine, "PUSH_REQUEST\u0000".toByteArray(Charsets.UTF_8), deadline)
-            val pushDeadline = minOf(deadline, System.currentTimeMillis() + 3000)
+            // v1.12: same — the PUSH_REPLY gets the full
+            // remaining deadline (item 9 probe check).
+            val pushDeadline = deadline
             while (System.currentTimeMillis() < pushDeadline) {
                 app.readMore() ?: break
                 val text = app.textSoFar()

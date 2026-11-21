@@ -42,6 +42,11 @@ object OvpnEngine {
     @Volatile var lastStateMsg: String? = null
     @Volatile var waitingForInput: Boolean = false
     @Volatile var waitingForInputMsg: String? = null
+    // v1.12: instant UI sync — the activity sets this in
+    // onResume; the engine calls it at the end of every
+    // state event so the orb refreshes immediately instead
+    // of waiting for the 2s poller (item 5).
+    @Volatile var stateListener: (() -> Unit)? = null
     val logLines: MutableList<String> = mutableListOf()
 
     fun addLog(line: String) {
@@ -60,6 +65,9 @@ object OvpnEngine {
     }
 
     @Volatile var pendingProfile3: OvpnProfile? = null
+    @Volatile var chainProxyPort: Int? = null
+    @Volatile var lastChainProxyDiag: String = ""
+    @Volatile var chainProxyActive: Boolean = false
     private var pendingProfile: OvpnProfile? = null
     private var pendingCallback: ((Boolean) -> Unit)? = null
     @Volatile private var appCtx: Context? = null
@@ -73,6 +81,11 @@ object OvpnEngine {
 
     /** Called by Ovpn3Client on the connect thread. */
     fun onOvpn3Event(name: String, info: String, error: Boolean, fatal: Boolean) {
+        // 1.72: Monitoring session history — was a
+        // session live before this event? (A CONNECTED
+        // after a live session cannot happen; a
+        // DISCONNECTED/fatal after one closes it.)
+        val wasLive = isConnected
         try {
             lastState = name
             lastStateMsg = info
@@ -83,6 +96,14 @@ object OvpnEngine {
                     waitingForInput = false
                     lastError = null
                     if (activeName == null) activeName = pendingProfile3?.name
+                    // 1.72: Monitoring session history.
+                    try {
+                        appCtx?.let {
+                            SessionHistory.begin(it, "openvpn",
+                                activeName ?: pendingProfile3?.name ?: "",
+                                "openvpn", pendingProfile3?.hostname ?: "")
+                        }
+                    } catch (_: Exception) {}
                     addLog("CONNECTED: $info")
                 }
                 "DISCONNECTED" -> {
@@ -139,6 +160,16 @@ object OvpnEngine {
                     activeName = null
                 }
             }
+            // v1.12: notify the UI immediately (item 5).
+            try { stateListener?.invoke() } catch (_: Throwable) {}
+            // 1.72: Monitoring session history — a live
+            // session that just stopped being live is
+            // closed (DISCONNECTED, AUTH_FAILED, fatal).
+            // Intermediate states never clear
+            // isConnected, so they never close here.
+            if (wasLive && !isConnected) {
+                try { appCtx?.let { SessionHistory.end(it, lastError, "openvpn") } } catch (_: Exception) {}
+            }
         } catch (_: Throwable) {}
     }
 
@@ -146,9 +177,26 @@ object OvpnEngine {
      *  OpenVpnActivity handles requestCode 701. */
     // 2.38: preserveChainProxy sits BEFORE callback so
     // existing trailing-lambda calls keep compiling.
-    fun connect(activity: Activity, profile: OvpnProfile, callback: (Boolean) -> Unit) {
+    fun connect(activity: Activity, profile: OvpnProfile, preserveChainProxy: Boolean = false, callback: (Boolean) -> Unit) {
+        // Stop any other VPN first (v2ray / WireGuard),
+        // because Android allows only one VPN at a time.
+        try {
+            if (VpnClientService.isRunning) {
+                val stop = Intent(activity, VpnClientService::class.java)
+                stop.action = "STOP"
+                stop.putExtra("stop_gen", VpnClientService.sessionGen)
+                activity.startService(stop)
+                VpnClientService.isRunning = false
+            }
+        } catch (_: Throwable) {}
         // Stop a previous OpenVPN3 session.
+        val savedChainPort = chainProxyPort
+        val savedChainActive = chainProxyActive
         try { disconnect() } catch (_: Throwable) {}
+        if (preserveChainProxy) {
+            chainProxyPort = savedChainPort
+            chainProxyActive = savedChainActive
+        }
         lastError = null
         isConnected = false
         isConnecting = true
@@ -192,6 +240,7 @@ object OvpnEngine {
         try {
             val svcIntent = Intent(ctx, Ovpn3VpnService::class.java)
             ctx.startService(svcIntent)
+            if (!chainProxyActive) try { QuickConnect.record(ctx, "openvpn", profile.name) } catch (_: Exception) {}
             cb?.invoke(true)
         } catch (e: Throwable) {
             lastError = t("وصل نشد: ${e.message ?: e.javaClass.simpleName}", "Failed to connect: ${e.message ?: e.javaClass.simpleName}")
@@ -203,6 +252,13 @@ object OvpnEngine {
     }
 
     fun disconnect() {
+        chainProxyActive = false
+        chainProxyPort = null
+        // 1.72: Monitoring session history — a manual
+        // disconnect is a clean end (no-op when no
+        // OpenVPN session is open).
+        try { appCtx?.let { SessionHistory.end(it, null, "openvpn") } } catch (_: Exception) {}
+        try { appCtx?.getSharedPreferences("renamer_smart", android.content.Context.MODE_PRIVATE)?.edit()?.putBoolean("smart_owns_vpn", false)?.apply() } catch (_: Exception) {}
         try {
             Ovpn3VpnService.instance?.let { svc ->
                 val stop = Intent(svc, Ovpn3VpnService::class.java)

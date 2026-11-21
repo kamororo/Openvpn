@@ -2,28 +2,39 @@ package com.renamer
 
 import android.content.Context
 
-/** App language (standalone Openvpn app, v1.1).
+/** App language, chosen in the v2ray Settings section.
  *  Stored in renamer_settings, key "app_language":
- *  "fa", "en" or "ru". DEFAULT IS PERSIAN (fa) —
- *  v1.0 followed the phone and came up English on
- *  the user's phone; the default must be Persian
- *  like the main app. Once the user picks a
- *  language in the drawer, that choice wins.
- *  t() returns the Persian string by default, the
- *  English one for "en", and the Russian one for
- *  "ru" from the RU map (English fallback when a
- *  string has no Russian entry yet — every static
- *  UI string is covered; dynamic strings use
- *  t3() with an explicit Russian form). */
+ *  "fa" or "en". When nothing is stored yet (first
+ *  launch), the phone's language decides: a Persian
+ *  phone gets Persian, anything else gets English.
+ *  Once the user picks a language in the app, that
+ *  choice wins from then on. t() returns the Persian
+ *  string by default, the English one when English is
+ *  selected. Applied to the v2ray page, the home menu
+ *  and the emergency page; other sections keep their
+ *  current strings and can be moved to t() later. */
 object AppLanguage {
+    fun isEnglish(ctx: Context): Boolean {
+        val sp = ctx.getSharedPreferences("renamer_settings", Context.MODE_PRIVATE)
+        if (sp.contains("app_language")) {
+            return sp.getString("app_language", "fa") == "en"
+        }
+        // First launch: follow the phone's language.
+        return java.util.Locale.getDefault().language != "fa"
+    }
+
+    /** "fa", "en" or "ru". Stored choice wins; on first
+     *  launch the phone language decides (fa phone ->
+     *  fa, anything else -> en), as in isEnglish(). */
     fun lang(ctx: Context): String {
         return try {
-            ctx.getSharedPreferences("renamer_settings", Context.MODE_PRIVATE)
-                .getString("app_language", null)?.takeIf { it in setOf("fa", "en", "ru") } ?: "fa"
+            val sp = ctx.getSharedPreferences("renamer_settings", Context.MODE_PRIVATE)
+            if (sp.contains("app_language")) {
+                sp.getString("app_language", "fa")?.takeIf { it in setOf("fa", "en", "ru") } ?: "fa"
+            } else if (java.util.Locale.getDefault().language == "fa") "fa" else "en"
         } catch (_: Exception) { "fa" }
     }
 
-    fun isEnglish(ctx: Context): Boolean = lang(ctx) == "en"
     fun isRussian(ctx: Context): Boolean = lang(ctx) == "ru"
 
     fun t(ctx: Context, fa: String, en: String): String {
@@ -45,6 +56,30 @@ object AppLanguage {
     fun set(ctx: Context, lang: String) {
         ctx.getSharedPreferences("renamer_settings", Context.MODE_PRIVATE)
             .edit().putString("app_language", lang).apply()
+    }
+
+    // ---------- 2.90: v2ray-only language ----------
+    // The v2ray Settings language button used to write the
+    // GLOBAL app_language, so picking English there turned
+    // the WHOLE app English. v2ray now has its own pref,
+    // "v2ray_language"; when nothing is stored yet it falls
+    // back to the global choice, so existing users keep
+    // their language until they change it in v2ray.
+    fun v2rayIsEnglish(ctx: Context): Boolean {
+        val sp = ctx.getSharedPreferences("renamer_settings", Context.MODE_PRIVATE)
+        if (sp.contains("v2ray_language")) {
+            return sp.getString("v2ray_language", "fa") == "en"
+        }
+        return isEnglish(ctx)
+    }
+
+    fun v2rayT(ctx: Context, fa: String, en: String): String {
+        return if (v2rayIsEnglish(ctx)) en else fa
+    }
+
+    fun setV2rayLang(ctx: Context, lang: String) {
+        ctx.getSharedPreferences("renamer_settings", Context.MODE_PRIVATE)
+            .edit().putString("v2ray_language", lang).apply()
     }
 
     /** Russian for every static user-visible English

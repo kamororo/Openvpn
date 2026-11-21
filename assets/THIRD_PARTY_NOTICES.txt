@@ -1,0 +1,27 @@
+Third-party software in Internet Azad 2026
+==========================================
+
+1. aether — the MASQUE / WARP engine used by the free-WARP section
+   (WireGuard & Amnezia page, "free WARP")
+   - Version bundled: 2.3.0
+   - Source: https://github.com/mbm110/MSN-GUARD (core/aether)
+   - License: GNU Affero General Public License v3.0 only (AGPL-3.0-only).
+     The full license text ships in this app as assets/agpl-3.0.txt.
+   - What was used: the aether engine library (libaether.so) and a thin
+     JNI bridge written for this app (libaetherbridge.so, in
+     src/com/renamer/AetherBridge.kt + aether_bridge.c). No other part
+     of MSN-GUARD is bundled: no Psiphon, no Tor, no wom.
+   - Corresponding source: the aether source is the upstream repository
+     above (core/aether, tag/commit as bundled in v1.50). The JNI bridge
+     source is part of this app's source tree. The app's own source is
+     available from the creator on request under the AGPL-3.0 terms.
+
+2. Xray-core — the proxy core used by the v2ray / chain / emergency
+   sections (libgojni.so). Apache License 2.0.
+   Source: https://github.com/XTLS/Xray-core
+
+3. WireGuard (libwg-go.so) and AmneziaWG (libawg-go.so) — the
+   WireGuard / Amnezia engines. MIT / GPL-2.0 (see their upstreams).
+
+4. ics-openvpn / OpenVPN 3 — the OpenVPN engine. GPL-2.0 / AGPL-3.0
+   (OpenVPN 3 core). Source: https://github.com/OpenVPN/openvpn3

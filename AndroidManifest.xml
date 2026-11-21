@@ -1,17 +1,50 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.renamer.openvpn"
-    android:versionCode="6"
-    android:versionName="1.5">
+    android:versionCode="74"
+    android:versionName="1.73">
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="36" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 1.73 (worker C): the update checker installs a downloaded
+         APK through the system installer; the app must declare
+         this, and Android 8+ additionally needs the per-app
+         "allow from this source" switch (checked at install time). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
+    <!-- Permissions the ics-openvpn core needs, which were
+         in its own library manifest but are NOT merged
+         by our manual aapt2 link, so they must live here:
+         ACCESS_NETWORK_STATE (DeviceStateReceiver calls
+         getActiveNetworkInfo, which throws SecurityException
+         without it) and POST_NOTIFICATIONS. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Smart Connect must list every installed app (Telegram,
+         Instagram, ...) to let the user pick triggers. Without
+         this, Android 11+ package visibility hides most
+         third-party apps from getInstalledApplications. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Android 14+ (targetSdk 34): a foreground service
+         MUST declare its type, otherwise startForeground()
+         throws MissingForegroundServiceTypeException, which
+         OpenVPNService catches in showNotification, so the
+         service never becomes foreground and the system
+         then crashes the app with
+         ForegroundServiceDidNotStartInTimeException —
+         exactly the "app keeps stopping" the user
+         saw in v1.24 right after CONNECTING. VPN has no
+         dedicated type, so specialUse + its permission. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.VIBRATE" />
-    <!-- v1.2: let the app resolve the Telegram app for
+    <!-- v1.2 (standalone): let the app resolve the Telegram app for
          the About channel link (tg:// + https targeted
          at the Telegram packages) on Android 11+. -->
     <queries>
@@ -22,17 +55,22 @@
             <data android:scheme="tg" />
         </intent>
     </queries>
-    <application android:label="Openvpn" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:theme="@android:style/Theme.Material.Light.NoActionBar">
-        <activity android:name="com.renamer.OpenVpnActivity" android:exported="true" android:screenOrientation="portrait">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+    <application android:label="اینترنت آزاد 2026" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:usesCleartextTraffic="true">
+        <activity android:name="com.renamer.PinActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.HomeActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.PublicActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.VpnActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.EmergencyActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.WireGuardActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.OpenVpnActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name="com.renamer.OpenVpnImportActivity" android:exported="false" android:screenOrientation="portrait" />
-        <!-- OpenVPN3 engine's own VpnService. It runs the OpenVPN3
-             core in-process and builds the TUN through the TunBuilder
-             callbacks, exactly like the official OpenVPN Connect app. -->
+        <!-- 3.03: TunnelBearActivity is gone — the TunnelBear box lives on the OpenVPN page itself. -->
+        <!-- OpenVPN3 engine's own VpnService. It runs
+             the OpenVPN3 core in-process and builds
+             the TUN through the TunBuilder callbacks,
+             exactly like the official OpenVPN Connect
+             app. This replaces the ics-openvpn 2.x
+             engine (kept declared below, unused). -->
         <service android:name="com.renamer.Ovpn3VpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:exported="false">
@@ -41,9 +79,9 @@
             </intent-filter>
         </service>
         <!-- Official ics-openvpn core's own VpnService.
-             OpenVpnApi starts it, and it builds the TUN and runs
-             the native openvpn binary, exactly like the official
-             OpenVPN Connect app. -->
+             OpenVpnApi starts it, and it builds the TUN
+             and runs the native openvpn binary, exactly
+             like the official OpenVPN Connect app. -->
         <service android:name="de.blinkt.openvpn.core.OpenVPNService"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:foregroundServiceType="specialUse"
@@ -52,9 +90,10 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
-        <!-- Activities the ics-openvpn notification refers to
-             (disconnect action, user input). Without them, tapping
-             the notification action would fail. -->
+        <!-- Activities the ics-openvpn notification
+             refers to (disconnect action, user input).
+             Without them, tapping the notification
+             action would fail. -->
         <activity android:name="de.blinkt.openvpn.DisconnectVPNActivity"
             android:exported="false"
             android:theme="@style/blinkt.dialog" />
@@ -63,5 +102,101 @@
         <service android:name="de.blinkt.openvpn.core.OpenVPNStatusService"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:exported="false" />
+        <!-- Official WireGuard Go backend's own VpnService.
+             GoBackend starts this service itself and builds
+             the TUN through it, exactly like the official
+             WireGuard app. -->
+        <service
+            android:name="com.wireguard.android.backend.GoBackend$VpnService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:exported="false" />
+        <!-- AmneziaWG Go backend's own VpnService (same shape as
+             WireGuard's, but loading libawg-go.so). Declared
+             alongside the WG service so both engines coexist. -->
+        <service
+            android:name="org.amnezia.awg.backend.GoBackend$VpnService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:exported="false" />
+        <activity android:name="com.renamer.HomeSettingsActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.ReorderActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.ChangePublicPinActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.AppLogActivity" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.VersionHistoryActivity" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.GuideDetailActivity" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.WidgetToggleActivity" android:theme="@android:style/Theme.Translucent.NoTitleBar" android:exported="false" android:screenOrientation="portrait"  android:taskAffinity="" android:excludeFromRecents="true"/>
+        <activity android:name="com.renamer.WelcomeActivity" android:exported="true" android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name="com.renamer.LoginPersonalizationActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.GuideActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.ScanActivity" android:exported="false" android:screenOrientation="portrait" />
+        <service android:name="com.renamer.VpnClientService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+        <activity android:name="com.renamer.VpnSettingsActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.SmartConnectActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.VpnSubActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.VpnSubEditActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.CloudflareActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.WidgetStudioActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.WidgetCustomizeActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name="com.renamer.StudioToggleActivity" android:exported="false" android:screenOrientation="portrait" android:theme="@android:style/Theme.Translucent.NoTitleBar"  android:taskAffinity="" android:excludeFromRecents="true"/>
+        <activity android:name="com.renamer.LastConnectToggleActivity" android:exported="false" android:screenOrientation="portrait" android:theme="@android:style/Theme.Translucent.NoTitleBar"  android:taskAffinity="" android:excludeFromRecents="true"/>
+        <service android:name="com.renamer.ProxyOnlyService" android:exported="false" android:foregroundServiceType="specialUse" />
+        <service android:name="com.renamer.PingTestService" android:exported="false" android:foregroundServiceType="dataSync" />
+        <service android:name="com.renamer.WgTestService" android:exported="false" android:foregroundServiceType="dataSync" />
+        <service android:name="com.renamer.SmartConnectService" android:exported="false" android:foregroundServiceType="dataSync" />
+        <service android:name="com.renamer.TbCreationService" android:exported="false" android:foregroundServiceType="dataSync" />
+        <receiver android:name="com.renamer.VpnWidgetProvider" android:exported="false">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_v2ray" />
+        </receiver>
+        <receiver android:name="com.renamer.WgWidgetProvider" android:exported="false">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_wireguard" />
+        </receiver>
+        <receiver android:name="com.renamer.OvpnWidgetProvider" android:exported="false">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_openvpn" />
+        </receiver>
+        <receiver android:name="com.renamer.SectionWidgetProvider" android:exported="false">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_section" />
+        </receiver>
+        <receiver android:name="com.renamer.SectionWidgetSmall" android:exported="false">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_section_small" />
+        </receiver>
+        <receiver android:name="com.renamer.SectionWidgetLarge" android:exported="false">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_section_large" />
+        </receiver>
+        <receiver android:name="com.renamer.VpnActionReceiver" android:exported="false" />
+        <receiver android:name="com.renamer.WidgetPinReceiver" android:exported="false">
+            <intent-filter><action android:name="com.renamer.openvpn.ACTION_WIDGET_PINNED" /></intent-filter>
+        </receiver>
+            <receiver android:name="com.renamer.SmartBootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+        <!-- 1.73 (worker C): serves a downloaded update APK to the
+             system installer (ApkFileProvider.kt — the build has no
+             androidx.core, so this minimal provider is the
+             FileProvider contract: content:// URI, read-only,
+             filesDir/update/ only, exported=false). -->
+        <provider android:name="com.renamer.ApkFileProvider"
+            android:authorities="com.renamer.openvpn.apkprovider"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 </manifest>

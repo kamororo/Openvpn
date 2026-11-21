@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 2.17: connected orb: light centre fading to green at the rim. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <gradient
+        android:type="radial"
+        android:gradientRadius="32dp"
+        android:centerColor="#C8E6C9"
+        android:endColor="#43A047" />
+</shape>

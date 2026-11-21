@@ -34,7 +34,20 @@ import kotlin.math.tan
  *  map view and crops the exact view-sized region around the measured
  *  lat/lon, so the pin sits at the true location. If any tile fails
  *  to load, the panel falls back to a plain drawn placeholder (never
- *  a broken image, never fake streets). */
+ *  a broken image, never fake streets).
+ *
+ *  1.74 (item A): the map is ZOOMABLE + COMPLETE. Zoom range 11–16
+ *  (default 13); the stitched area is the view PLUS one full tile
+ *  of padding on every side, so the map reads as a complete map, not
+ *  a cropped partial, and a short drag never shows a blank edge.
+ *  The pin is NEVER pinned to a fixed screen point: its screen
+ *  position is recomputed from the true lat/lon on every transform
+ *  (zoom step, pan, re-centre) — see ZoomTilePlan.pinX/pinY,
+ *  panForZoomChange and centreLatLonAfterPan. Panning past
+ *  MAP_PAN_RECENTER_PX re-centres the map on the lat/lon now at the
+ *  view centre (the anchor moves, the pin stays true). No new map
+ *  SDK dependency: still raw OSM raster tiles + ScaleGestureDetector
+ *  in the view. */
 object SpeedTestPanelPure {
 
     // ---------- panel geometry (mockup-measured, variant C floating) ----------
@@ -304,5 +317,202 @@ object SpeedTestPanelPure {
         val ox = (left - x0 * TILE_SIZE_PX).toInt()
         val oy = (top - y0 * TILE_SIZE_PX).toInt()
         return TilePlan(tiles, stitchedW, stitchedH, ox, oy, viewWpx, viewHpx)
+    }
+
+    // ---------- zoomable map (1.74 item A) ----------
+    // Zoom range: 11 (region) .. 16 (street detail); 13 is the
+    // 1.73 default and stays the default. Zooming re-fetches tiles
+    // at the new level; the view never upscales one zoom's tiles and
+    // calls it another zoom (except as a transient visual while the
+    // new tiles load — the pin is always placed from the true
+    // lat/lon, never from a scaled guess).
+
+    /** Zoom limits + default (MAP_ZOOM == default, kept for 1.73
+     *  callers). */
+    const val MAP_ZOOM_MIN = 11
+    const val MAP_ZOOM_MAX = 16
+    const val MAP_ZOOM_DEFAULT = 13
+
+    /** Tiles of padding around the view on every side: the stitched
+     *  bitmap is the view plus this ring, so the map reads complete
+     *  and a short drag never exposes a blank edge. */
+    const val MAP_PAD_TILES = 1
+
+    /** Drag distance (px, either axis) past which the map re-centres
+     *  on the lat/lon now at the view centre instead of dragging
+     *  further. Safely inside the padded area (a 1-tile pad gives
+     *  >=220px of drag room in every direction for this panel's
+     *  view size), so re-centring never shows a blank edge. */
+    const val MAP_PAN_RECENTER_PX = 200
+
+    /** A zoom clamped into the supported range. */
+    fun clampZoom(z: Int): Int = z.coerceIn(MAP_ZOOM_MIN, MAP_ZOOM_MAX)
+
+    /** The Slippy tile (x, y) containing a lat/lon at a zoom.
+     *  Null for out-of-range coordinates. */
+    fun tileXY(lat: Double, lon: Double, zoom: Int): Pair<Int, Int>? {
+        val (px, py) = lonLatToPixel(lat, lon, zoom) ?: return null
+        return floor(px / TILE_SIZE_PX).toInt() to floor(py / TILE_SIZE_PX).toInt()
+    }
+
+    /** Inverse Mercator: global pixel coordinates -> lat/lon at a
+     *  zoom. Null for out-of-range pixels. Used when re-centring
+     *  after a pan (the new anchor is the lat/lon now at the view
+     *  centre). */
+    fun pixelToLonLat(px: Double, py: Double, zoom: Int): Pair<Double, Double>? {
+        if (zoom < 0 || zoom > 19) return null
+        val n = (1 shl zoom).toDouble() * TILE_SIZE_PX
+        if (px < 0.0 || px > n || py < 0.0 || py > n) return null
+        val lon = px / n * 360.0 - 180.0
+        val latRad = kotlin.math.atan(kotlin.math.sinh(PI * (1.0 - 2.0 * py / n)))
+        return latRad * 180.0 / PI to lon
+    }
+
+    /** A zoomable tile plan: like planTiles, but the fetched area is
+     *  the view PLUS MAP_PAD_TILES of padding on every side, and the
+     *  plan carries the pin's position inside the cropped view.
+     *
+     *  Pan convention: panX/panY shift the MAP CONTENT in screen px
+     *  relative to the centred anchor (dragging the map right by
+     *  +dx moves the pin right by +dx). The crop origin follows the
+     *  window (left = anchorPx - view/2 - pan), so the crop is
+     *  always fully inside the stitched bitmap for ANY pan — the
+     *  fetch range is built around the panned window.
+     *
+     *  pinX/pinY are computed the long way — tile offset + the
+     *  point's position inside its tile, minus the crop origin —
+     *  so they track the TRUE lat/lon, not a stored screen point.
+     *  For the anchor itself pinX == viewW/2 + panX (and likewise
+     *  Y) at every zoom; the test asserts both the identity and the
+     *  independent tile-math recomputation. */
+    data class ZoomTilePlan(
+        val plan: TilePlan,
+        /** Pin tip position inside the cropped view, px. */
+        val pinX: Double,
+        val pinY: Double
+    )
+
+    fun planZoomableTiles(
+        lat: Double, lon: Double, zoom: Int,
+        viewWpx: Int, viewHpx: Int,
+        panXPx: Double = 0.0, panYPx: Double = 0.0,
+        padTiles: Int = MAP_PAD_TILES
+    ): ZoomTilePlan? {
+        if (viewWpx <= 0 || viewHpx <= 0 || zoom < 0 || zoom > 19 || padTiles < 0) return null
+        val (cx, cy) = lonLatToPixel(lat, lon, zoom) ?: return null
+        val nTiles = 1 shl zoom
+        // Window the view must cover, centred on the anchor, shifted
+        // by the pan (content shift: window moves opposite).
+        val left = cx - viewWpx / 2.0 - panXPx
+        val top = cy - viewHpx / 2.0 - panYPx
+        val right = cx + viewWpx / 2.0 - panXPx
+        val bottom = cy + viewHpx / 2.0 - panYPx
+        val padPx = padTiles * TILE_SIZE_PX
+        val x0 = floor((left - padPx) / TILE_SIZE_PX).toInt()
+        val x1 = floor((right + padPx) / TILE_SIZE_PX).toInt()
+        val y0 = floor((top - padPx) / TILE_SIZE_PX).toInt()
+        val y1 = floor((bottom + padPx) / TILE_SIZE_PX).toInt()
+        if (y0 < 0 || y1 >= nTiles) return null
+        val tiles = ArrayList<TileFetch>()
+        for (ty in y0..y1) {
+            for (tx in x0..x1) {
+                val wrapped = ((tx % nTiles) + nTiles) % nTiles
+                tiles += TileFetch(wrapped, ty, (tx - x0) * TILE_SIZE_PX, (ty - y0) * TILE_SIZE_PX)
+            }
+        }
+        val stitchedW = (x1 - x0 + 1) * TILE_SIZE_PX
+        val stitchedH = (y1 - y0 + 1) * TILE_SIZE_PX
+        // Crop origin (Double precision; TilePlan stores the Int
+        // truncation — under 1px apart, invisible).
+        val cropXD = left - x0 * TILE_SIZE_PX
+        val cropYD = top - y0 * TILE_SIZE_PX
+        val base = TilePlan(tiles, stitchedW, stitchedH, cropXD.toInt(), cropYD.toInt(), viewWpx, viewHpx)
+        // Pin via tile math: its tile's offset in the stitched
+        // bitmap + its position inside that tile, minus the crop.
+        val (pinTileX, pinTileY) = tileXY(lat, lon, zoom) ?: return null
+        val pinTile = tiles.firstOrNull { it.x == pinTileX && it.y == pinTileY } ?: return null
+        val pinInStitchedX = pinTile.dx + (cx - pinTileX * TILE_SIZE_PX)
+        val pinInStitchedY = pinTile.dy + (cy - pinTileY * TILE_SIZE_PX)
+        return ZoomTilePlan(base, pinInStitchedX - cropXD, pinInStitchedY - cropYD)
+    }
+
+    /** The pin's screen position for an anchor lat/lon, computed
+     *  straight from the world pixels (the identity the zoomable
+     *  plan must satisfy: centre + pan, at every zoom). */
+    fun pinScreenPosition(
+        lat: Double, lon: Double, zoom: Int,
+        viewWpx: Int, viewHpx: Int,
+        panXPx: Double = 0.0, panYPx: Double = 0.0
+    ): Pair<Double, Double>? {
+        if (lonLatToPixel(lat, lon, zoom) == null) return null
+        return viewWpx / 2.0 + panXPx to viewHpx / 2.0 + panYPx
+    }
+
+    /** The pan that keeps the world point under a gesture focus
+     *  (focusX, focusY in view px) exactly under that focus after a
+     *  zoom step from oldZoom to newZoom. Derivation: screen pos of
+     *  a world point w is w(z) - anchor(z) + view/2 + pan, and
+     *  w(z') = w(z) * 2^(z'-z); solving for the pan that leaves the
+     *  focus point's screen pos unchanged gives
+     *  pan' = (f - view/2) - (f - view/2 - pan) * 2^(z'-z).
+     *  NOTE: with the focus at the view centre the pan SCALES by
+     *  2^delta (a pin off-centre is twice as far off-centre at one
+     *  zoom in) — it does NOT stay equal. With the focus ON the
+     *  pin, pan' == pan and the pin does not move on screen. */
+    fun panForZoomChange(
+        anchorLat: Double, anchorLon: Double,
+        oldZoom: Int, newZoom: Int,
+        viewWpx: Int, viewHpx: Int,
+        panX: Double, panY: Double,
+        focusX: Double, focusY: Double
+    ): Pair<Double, Double> {
+        // The anchor itself is unused beyond validation: the
+        // transform is purely geometric once the focus is known.
+        if (lonLatToPixel(anchorLat, anchorLon, oldZoom) == null ||
+            lonLatToPixel(anchorLat, anchorLon, newZoom) == null
+        ) return panX to panY
+        val scale = Math.pow(2.0, (newZoom - oldZoom).toDouble())
+        val newPanX = (focusX - viewWpx / 2.0) - (focusX - viewWpx / 2.0 - panX) * scale
+        val newPanY = (focusY - viewHpx / 2.0) - (focusY - viewHpx / 2.0 - panY) * scale
+        return newPanX to newPanY
+    }
+
+    /** The lat/lon now at the view centre after panning by
+     *  (panX, panY): the centre shows the world pixel
+     *  (anchorPx - pan). Null when the anchor or the result is
+     *  out of range. */
+    fun centreLatLonAfterPan(
+        lat: Double, lon: Double, zoom: Int,
+        panXPx: Double, panYPx: Double
+    ): Pair<Double, Double>? {
+        val (cx, cy) = lonLatToPixel(lat, lon, zoom) ?: return null
+        return pixelToLonLat(cx - panXPx, cy - panYPx, zoom)
+    }
+
+    /** True when a pan has gone far enough to re-centre the map
+     *  (the anchor moves to the lat/lon now at the view centre). */
+    fun panNeedsRecenter(panXPx: Double, panYPx: Double): Boolean =
+        kotlin.math.abs(panXPx) > MAP_PAN_RECENTER_PX ||
+            kotlin.math.abs(panYPx) > MAP_PAN_RECENTER_PX
+
+    /** Clamp a pan so the cropped view stays fully inside a
+     *  stitched bitmap fetched for (fetchPanX, fetchPanY).
+     *  The crop origin for pan p is plan.crop - (p - fetchPan);
+     *  it must stay in [0, stitched - view] on both axes. Returns
+     *  the clamped pan (unchanged when already inside). */
+    fun clampPanToPlan(
+        panX: Double, panY: Double,
+        fetchPanX: Double, fetchPanY: Double,
+        plan: TilePlan, viewWpx: Int, viewHpx: Int
+    ): Pair<Double, Double> {
+        fun clampAxis(pan: Double, fetchPan: Double, crop: Int, stitched: Int, view: Int): Double {
+            val slack = stitched - view // >= 0 for a padded plan
+            // crop - (pan - fetchPan) in [0, slack]
+            val lo = fetchPan + crop - slack
+            val hi = fetchPan + crop
+            return pan.coerceIn(lo.toDouble(), hi.toDouble())
+        }
+        return clampAxis(panX, fetchPanX, plan.cropX, plan.stitchedW, viewWpx) to
+            clampAxis(panY, fetchPanY, plan.cropY, plan.stitchedH, viewHpx)
     }
 }

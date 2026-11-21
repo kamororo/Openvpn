@@ -38,10 +38,13 @@ object HomeIcons {
         "wireguard" to "home_wireguard.png",
         "emergency" to "home_emergency.png",
         "cloudflare" to "home_cloudflare.png",
-        // 1.73: the speed-test tile reuses the pulse icon
-        // (assets/monitor.png, the bottom pill's pulse) as its
-        // tile art, in both modes.
-        "speedtest" to "home_speedtest.png",
+        // 1.74 (B): the speed-test tile gets a real speedometer/gauge
+        // in the same style as the other tiles. 1.73 pointed here at
+        // the pulse art — the wrong texture, and the user said so on
+        // device. The old file is left in place (the pulse is still
+        // the bottom pill's + the panel header's icon); only the
+        // tile moves.
+        "speedtest" to "home_speedometer.png",
     )
 
     private val cache = mutableMapOf<String, Bitmap?>()

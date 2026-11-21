@@ -40,7 +40,9 @@ import android.widget.Toast
  *
  * The last method is recorded at connect time by a one-line hook in each
  * section's own connect path (v2ray / WireGuard / OpenVPN / Emergency /
- * Smart / Hydra / Chain). The card never implements connection logic
+ * Smart / Hydra / Chain). 1.74 (C): free warp records ONLY after its
+ * real-traffic verify passes (never at service start — see M_WARP).
+ * The card never implements connection logic
  * itself: tapping it reuses each method's EXISTING connect/disconnect
  * path. Live state comes from the app's own composite
  * (VpnClientService.isRunning || WgDirect.isLive || OvpnEngine.isConnected).
@@ -67,6 +69,12 @@ object QuickConnect {
 
     const val M_V2RAY = "v2ray"
     const val M_WIREGUARD = "wireguard"
+    /** 1.74 (C): free warp — the MASQUE/WARP path (aether CLI,
+     *  WgDirect/WarpConnect area). Recorded ONLY after the
+     *  real-traffic verify passes (VpnClientService WARP_VERIFIED
+     *  for the MASQUE/AETHER/GOOL rungs, WireGuardActivity's
+     *  WG-rung verdict); never at service start. */
+    const val M_WARP = WarpLastConnectPure.METHOD_WARP
     const val M_OPENVPN = "openvpn"
     const val M_EMERGENCY = "emergency"
     const val M_SMART = "smart"
@@ -200,6 +208,16 @@ object QuickConnect {
     fun recordServiceStart(ctx: Context, tag: String?, currentLink: String?, origLink: String?) {
         val t = tag ?: M_V2RAY
         if (t == M_HYDRA) return
+        // 1.74 (C): warp is never recorded here either — this
+        // hook runs at service START, before any traffic has
+        // passed, and its only config candidate is the
+        // "WARP::<id>" link, which is not a display name.
+        // A verified warp session records itself with its
+        // card name ("free warp") at the verify point
+        // (VpnClientService WARP_VERIFIED / the WG rung's
+        // verdict in WireGuardActivity). No future caller
+        // may land a WARP:: link on the card through here.
+        if (t == M_WARP) return
         // The engine's original link is the ping key when the session link
         // was engine-mutated; else the session link itself; else (plain
         // v2ray, no link extra) the user's selected config.
@@ -227,6 +245,10 @@ object QuickConnect {
         val en = AppLanguage.isEnglish(ctx)
         return when (method) {
             M_WIREGUARD -> if (en) "WireGuard" else "وایرگارد"
+            // 1.74 (C): the warp section — line 1 reads
+            // «آخرین اتصال وارپ رایگان»; line 2 is the
+            // record's own name ("free warp").
+            M_WARP -> WarpLastConnectPure.displayMethodName(en)
             M_OPENVPN -> "OpenVPN"
             M_EMERGENCY -> if (en) "Emergency" else "اتصال اضطراری"
             M_SMART -> if (en) "Smart Connect" else "اتصال هوشمند"
@@ -305,7 +327,7 @@ object QuickConnect {
      *  own page opens instead of connecting a different config. */
     fun connect(activity: Activity) {
         val method = when (lastMethod(activity)) {
-            M_V2RAY, M_WIREGUARD, M_OPENVPN, M_EMERGENCY, M_SMART -> lastMethod(activity)!!
+            M_V2RAY, M_WIREGUARD, M_WARP, M_OPENVPN, M_EMERGENCY, M_SMART -> lastMethod(activity)!!
             else -> M_EMERGENCY
         }
         setConnecting(activity)
@@ -340,6 +362,35 @@ object QuickConnect {
                         clearConnecting(activity)
                         try { activity.startActivity(Intent(activity, WireGuardActivity::class.java)) } catch (_: Exception) {}
                     }
+                }
+            }
+            M_WARP -> {
+                // 1.74 (C): the exact last-connected free-warp
+                // record, by its card name ("free warp") — never
+                // the first record, never the active one when the
+                // recorded name is gone (2.81 exact-config rule).
+                // The reconnect itself MUST go through the warp
+                // page's own warpConnect (aether session tunnel /
+                // IP replacement / real-traffic verify) — starting
+                // VpnClientService directly here would skip all
+                // of that — so the page opens with an auto-connect
+                // extra and connects the record itself. Record
+                // gone -> the page opens and the user picks.
+                val ref = try {
+                    val records = WarpFree.loadAll(activity)
+                        .map { WarpLastConnectPure.WarpRef(it.id, it.name) }
+                    WarpLastConnectPure.resolve(records, lastConfig(activity))
+                } catch (_: Exception) { null }
+                if (ref == null) {
+                    clearConnecting(activity)
+                    try { activity.startActivity(Intent(activity, WireGuardActivity::class.java)) } catch (_: Exception) {}
+                } else {
+                    try {
+                        activity.startActivity(Intent(activity, WireGuardActivity::class.java).apply {
+                            putExtra("warp_auto_connect_id", ref.id)
+                            putExtra("warp_auto_connect_name", ref.name)
+                        })
+                    } catch (_: Exception) { clearConnecting(activity) }
                 }
             }
             M_OPENVPN -> {

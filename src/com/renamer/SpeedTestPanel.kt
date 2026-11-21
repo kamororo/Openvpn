@@ -55,7 +55,12 @@ import java.util.concurrent.CountDownLatch
  *  field shows «—». The map is real OpenStreetMap raster tiles
  *  centred on the measured lat/lon (no SDK, no API key, no WebView);
  *  if tiles fail to load, a plain drawn placeholder shows instead.
- *  The flag is the app's existing rendering — GeoFlag.flagEmoji as
+ *  1.74 (item A): the map is ZOOMABLE + COMPLETE — a ZoomableMapView
+ *  (pinch zoom + drag pan + +/- buttons, zoom 11–16, default 13)
+ *  over a LARGER stitched tile area (view + one tile of padding per
+ *  side), re-fetching tiles at the new zoom; the red pin is
+ *  recomputed from the true lat/lon on every transform, never
+ *  pinned to a fixed screen point. The flag is the app's existing
  *  text (same as CloudflareActivity's country rows); a country with
  *  no flag shows its name alone, never a wrong flag.
  *
@@ -170,45 +175,10 @@ object SpeedTestPanel {
         }
     }
 
-    /** The red map pin at the measured location, drawn in code:
-     *  a teardrop (circle + point) with a white centre dot and a
-     *  soft shadow ellipse underneath. */
-    private class PinView(ctx: Context) : View(ctx) {
-        private val redPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#EA4335")
-            style = Paint.Style.FILL
-        }
-        private val whitePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            style = Paint.Style.FILL
-        }
-        private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(60, 0, 0, 0)
-            style = Paint.Style.FILL
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            val d = resources.displayMetrics.density
-            val cx = width.toFloat() / 2f
-            // Pin tip lands exactly at the view's centre.
-            val tipY = height.toFloat() / 2f
-            val r = 11f * d
-            val cy = tipY - r * 1.15f
-            canvas.drawOval(RectF(cx - r * 0.9f, tipY - 1.5f * d, cx + r * 0.9f, tipY + 1.5f * d), shadowPaint)
-            val path = Path()
-            path.moveTo(cx, tipY)
-            path.lineTo(cx - r * 0.82f, cy + r * 0.35f)
-            path.addArc(RectF(cx - r, cy - r, cx + r, cy + r), 160f, 220f)
-            path.lineTo(cx, tipY)
-            path.close()
-            canvas.drawPath(path, redPaint)
-            canvas.drawCircle(cx, cy, r * 0.38f, whitePaint)
-        }
-    }
-
     /** Rounded-corner placeholder for the map while tiles load or
-     *  when they fail: a plain solid fill, never fake streets. */
+     *  when they fail: a plain solid fill, never fake streets.
+     *  (Also the map frame's background behind the ZoomableMapView,
+     *  which draws the same fill itself when it has no tiles.) */
     private class MapPlaceholderDrawable(
         private val dark: Boolean,
         private val radiusPx: Float
@@ -242,7 +212,27 @@ object SpeedTestPanel {
         private var netSig: String? = null
         private var netCallback: ConnectivityManager.NetworkCallback? = null
         private var geo: SpeedTestPanelPure.GeoInfo? = null
-        private var mapLoaded = false
+        // 1.74 (item A) map state: the measured anchor + current
+        // zoom. mapGen guards tile loads (only the latest zoom /
+        // re-centre load may display); mapShownKey skips a reload
+        // for the exact state already on screen.
+        private var mapLat: Double? = null
+        private var mapLon: Double? = null
+        private var mapZoom: Int = SpeedTestPanelPure.MAP_ZOOM_DEFAULT
+        private var mapGen = 0
+        private var mapShownKey: String? = null
+        /** Tile cache: stitched bitmaps per zoom (max 2, RGB_565),
+         *  so zooming back to a visited level is instant instead
+         *  of a re-fetch. Keyed by zoom only — cleared whenever
+         *  the anchor moves (new geo / re-centre / new test), so a
+         *  cached bitmap can never belong to another location. */
+        private val tileCache = LinkedHashMap<Int, CachedTiles>()
+        private data class CachedTiles(
+            val stitched: Bitmap,
+            val plan: SpeedTestPanelPure.TilePlan,
+            val fetchPanX: Double,
+            val fetchPanY: Double
+        )
 
         private lateinit var valDl: TextView
         private lateinit var valUl: TextView
@@ -253,9 +243,10 @@ object SpeedTestPanel {
         private lateinit var valCity: TextView
         private lateinit var valPostal: TextView
         private lateinit var valTimezone: TextView
-        private lateinit var mapImage: ImageView
-        private lateinit var pinView: View
+        private lateinit var mapView: ZoomableMapView
         private lateinit var cityPill: TextView
+        private lateinit var zoomInBtn: TextView
+        private lateinit var zoomOutBtn: TextView
         private lateinit var refreshView: View
         private var mapWpx = 0
         private var mapHpx = 0
@@ -304,14 +295,25 @@ object SpeedTestPanel {
                     LinearLayout.LayoutParams.MATCH_PARENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT)
             }
+            // 1.74 (merger): the header icon is the same speedometer/
+            // gauge art as the home tile — the user's order was that
+            // the speed-test icon must be a speed-test icon, and the
+            // header is part of the section. Isolated swap: only this
+            // ImageView changes. The bottom pill (HomeActivity) and
+            // the widget monitoring icon (SectionWidgetProvider) keep
+            // loading monitor.png in their own code and are untouched.
+            // The gauge is full-colour art (night / _day variants,
+            // same convention as HomeIcons), so NO colour filter is
+            // applied — tinting it blue would wash it out — and it
+            // is square (24×24) instead of the pulse's 24×17.
             val pulse = ImageView(activity).apply {
                 try {
-                    val bmp = BitmapFactory.decodeStream(activity.assets.open("monitor.png"))
+                    val asset = if (dark) "home_speedometer.png" else "home_speedometer_day.png"
+                    val bmp = BitmapFactory.decodeStream(activity.assets.open(asset))
                     setImageBitmap(bmp)
-                    setColorFilter(Color.parseColor(dlColor))
                 } catch (_: Exception) {}
                 scaleType = ImageView.ScaleType.CENTER_INSIDE
-                layoutParams = LinearLayout.LayoutParams(dp(24), dp(17))
+                layoutParams = LinearLayout.LayoutParams(dp(24), dp(24))
             }
             val title = TextView(activity).apply {
                 text = AppLanguage.t(activity, "تست سرعت", "Speed test")
@@ -350,8 +352,11 @@ object SpeedTestPanel {
             header.addView(closeView)
             card.addView(header)
 
-            // Map on top (~110dp, wide): real OSM tiles once the geo
-            // lands; a plain drawn placeholder until then / on failure.
+            // Map on top (~110dp, wide): 1.74 zoomable — pinch +
+            // drag + +/- buttons over a larger stitched tile area
+            // (ZoomableMapView); a plain drawn placeholder until
+            // tiles land / when they fail. The pin is drawn by the
+            // view itself, recomputed from the true lat/lon.
             val screenWpx = activity.resources.displayMetrics.widthPixels
             val panelWpx = screenWpx - dp(SpeedTestPanelPure.SIDE_MARGIN_DP) * 2
             mapWpx = panelWpx - dp(18) * 2
@@ -364,25 +369,78 @@ object SpeedTestPanel {
                 }
                 clipChildren = true
             }
-            mapImage = ImageView(activity).apply {
-                scaleType = ImageView.ScaleType.CENTER_CROP
+            // Map on top (~110dp, wide): 1.74 zoomable — pinch +
+            // drag + +/- buttons over a larger stitched tile area
+            // (ZoomableMapView); a plain drawn placeholder until
+            // tiles land / when they fail. The pin is drawn by the
+            // view itself, recomputed from the true lat/lon.
+            mapView = ZoomableMapView(activity).apply {
+                dark = this@Panel.dark
                 layoutParams = FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.MATCH_PARENT)
-                // Rounded corners on the tile bitmap itself.
                 clipToOutline = true
                 outlineProvider = object : ViewOutlineProvider() {
                     override fun getOutline(view: View, outline: android.graphics.Outline) {
                         outline.setRoundRect(0, 0, view.width, view.height, mapRadius)
                     }
                 }
+                listener = object : ZoomableMapView.MapListener {
+                    override fun onZoomStep(newZoom: Int, newPanX: Double, newPanY: Double) {
+                        mapZoom = newZoom
+                        refreshZoomButtons()
+                        val lat = mapLat ?: return
+                        val lon = mapLon ?: return
+                        loadMapAt(lat, lon, newZoom, newPanX, newPanY)
+                    }
+
+                    override fun onRecenter(newLat: Double, newLon: Double) {
+                        mapLat = newLat
+                        mapLon = newLon
+                        // The anchor moved: cached bitmaps belong
+                        // to the old anchor.
+                        clearTileCache()
+                        loadMapAt(newLat, newLon, mapZoom, 0.0, 0.0)
+                    }
+                }
             }
-            mapFrame.addView(mapImage)
-            pinView = PinView(activity).apply {
-                layoutParams = FrameLayout.LayoutParams(dp(28), dp(40), Gravity.CENTER)
-                visibility = View.GONE
+            mapFrame.addView(mapView)
+            // +/- zoom buttons, bottom corner (city pill is top):
+            // small round buttons, semi-transparent so the map
+            // stays readable underneath.
+            fun zoomButton(label: String, onTap: () -> Unit): TextView {
+                return TextView(activity).apply {
+                    text = label
+                    textSize = 16f
+                    setTypeface(null, android.graphics.Typeface.BOLD)
+                    setTextColor(Color.parseColor(if (dark) "#F2F3FA" else "#23232E"))
+                    gravity = Gravity.CENTER
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        shape = android.graphics.drawable.GradientDrawable.OVAL
+                        setColor(Color.parseColor(if (dark) "#CC2A3148" else "#E6FFFFFF"))
+                    }
+                    layoutParams = LinearLayout.LayoutParams(dp(28), dp(28))
+                    isClickable = true
+                    isFocusable = true
+                    setOnClickListener { onTap() }
+                }
             }
-            mapFrame.addView(pinView)
+            zoomInBtn = zoomButton("+") { mapView.zoomIn() }
+            zoomOutBtn = zoomButton("-") { mapView.zoomOut() }
+            val zoomColumn = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.BOTTOM or Gravity.END).apply {
+                    setMargins(dp(8), dp(8), dp(8), dp(8))
+                }
+            }
+            zoomColumn.addView(zoomInBtn)
+            zoomColumn.addView(zoomOutBtn.apply {
+                (layoutParams as LinearLayout.LayoutParams).topMargin = dp(6)
+            })
+            mapFrame.addView(zoomColumn)
             cityPill = TextView(activity).apply {
                 textSize = 13f
                 setTypeface(null, android.graphics.Typeface.BOLD)
@@ -581,10 +639,17 @@ object SpeedTestPanel {
                     cityPill.visibility = View.GONE
                 }
                 if (g?.lat != null && g.lon != null) {
-                    pinView.visibility = View.VISIBLE
-                    loadMap(g.lat, g.lon)
+                    mapLat = g.lat
+                    mapLon = g.lon
+                    mapZoom = SpeedTestPanelPure.MAP_ZOOM_DEFAULT
+                    clearTileCache()
+                    mapView.setAnchor(g.lat, g.lon)
+                    displayedStitched = null
+                    refreshZoomButtons()
+                    loadMapAt(g.lat, g.lon, mapZoom, 0.0, 0.0)
                 } else {
-                    pinView.visibility = View.GONE
+                    mapLat = null
+                    mapLon = null
                 }
             } catch (_: Exception) {}
         }
@@ -604,8 +669,14 @@ object SpeedTestPanel {
             registerNetCallback()
             setDownload(null); setUpload(null); setPing(null)
             setGeo(null)
-            mapLoaded = false
-            try { mapImage.setImageBitmap(null) } catch (_: Exception) {}
+            mapLat = null
+            mapLon = null
+            mapZoom = SpeedTestPanelPure.MAP_ZOOM_DEFAULT
+            mapShownKey = null
+            mapGen++
+            clearTileCache()
+            try { mapView.clearTiles() } catch (_: Exception) {}
+            displayedStitched = null
             try { refreshView.alpha = 0.5f } catch (_: Exception) {}
             // Own IP + geo, in parallel with the speed test.
             Thread {
@@ -689,24 +760,79 @@ object SpeedTestPanel {
             }
         }
 
-        /** Load the real map: the OSM tiles covering the view,
-         *  stitched and cropped around the measured lat/lon. Any
-         *  tile failure leaves the plain placeholder (never a broken
-         *  image, never fake streets). */
-        private fun loadMap(lat: Double, lon: Double) {
-            if (mapLoaded) return
-            mapLoaded = true
-            val plan = SpeedTestPanelPure.planTiles(
-                lat, lon, SpeedTestPanelPure.MAP_ZOOM, mapWpx, mapHpx) ?: return
+        /** Grey out the +/- zoom buttons at the zoom limits
+         *  (11 / 16); full opacity otherwise. */
+        private fun refreshZoomButtons() {
+            try {
+                if (!::zoomInBtn.isInitialized) return
+                zoomInBtn.alpha = if (mapView.isAtMaxZoom()) 0.35f else 1f
+                zoomOutBtn.alpha = if (mapView.isAtMinZoom()) 0.35f else 1f
+            } catch (_: Exception) {}
+        }
+
+        /** Drop the tile cache, recycling its bitmaps — EXCEPT the
+         *  one the view is currently displaying (recycling that
+         *  would crash the next draw; it is orphaned instead and
+         *  its native memory is freed by the Bitmap finalizer —
+         *  at most one such bitmap, panel-lifetime). The view drops
+         *  its reference on the next showTiles / clearTiles. */
+        private var displayedStitched: Bitmap? = null
+        private fun clearTileCache() {
+            try {
+                for ((_, cached) in tileCache) {
+                    try {
+                        if (cached.stitched !== displayedStitched &&
+                            !cached.stitched.isRecycled
+                        ) cached.stitched.recycle()
+                    } catch (_: Exception) {}
+                }
+                tileCache.clear()
+            } catch (_: Exception) {}
+        }
+
+        /** Load the real map for one (anchor, zoom, pan): the OSM
+         *  tiles covering the view PLUS one tile of padding per
+         *  side (so the map reads complete, not cropped), stitched
+         *  into one bitmap the ZoomableMapView crops + pans.
+         *  Any tile failure leaves the plain placeholder (never a
+         *  broken image, never fake streets). A cached zoom is
+         *  shown at once, no re-fetch. Only the latest load (mapGen)
+         *  may display, so a slow zoom-out can never overwrite a
+         *  newer zoom-in. */
+        private fun loadMapAt(lat: Double, lon: Double, zoom: Int, panX: Double, panY: Double) {
+            val key = "$lat|$lon|$zoom|$panX|$panY"
+            if (key == mapShownKey) return
+            val cached = tileCache[zoom]
+            if (cached != null) {
+                mapShownKey = key
+                try {
+                    displayedStitched = cached.stitched
+                    mapView.showTiles(cached.stitched, cached.plan, zoom, cached.fetchPanX, cached.fetchPanY)
+                    refreshZoomButtons()
+                } catch (_: Exception) {}
+                return
+            }
+            val zoomPlan = SpeedTestPanelPure.planZoomableTiles(
+                lat, lon, zoom, mapWpx, mapHpx, panX, panY) ?: run {
+                try { mapView.onTilesFailed() } catch (_: Exception) {}
+                return
+            }
+            val plan = zoomPlan.plan
+            val mg = ++mapGen
             Thread {
                 try {
+                    val opts = BitmapFactory.Options().apply {
+                        // Map tiles are opaque: RGB_565 halves the
+                        // stitched bitmap's memory (one padded
+                        // stitch is ~2.6 MB instead of ~5.2 MB).
+                        inPreferredConfig = Bitmap.Config.RGB_565
+                    }
                     val bitmaps = arrayOfNulls<Bitmap>(plan.tiles.size)
                     val latch = CountDownLatch(plan.tiles.size)
                     for ((idx, t) in plan.tiles.withIndex()) {
                         Thread {
                             try {
-                                val url = SpeedTestPanelPure.tileUrl(
-                                    SpeedTestPanelPure.MAP_ZOOM, t.x, t.y)
+                                val url = SpeedTestPanelPure.tileUrl(zoom, t.x, t.y)
                                 var conn: HttpURLConnection? = null
                                 try {
                                     conn = URL(url).openConnection() as HttpURLConnection
@@ -714,7 +840,7 @@ object SpeedTestPanel {
                                     conn.readTimeout = 8000
                                     conn.setRequestProperty("User-Agent", UA)
                                     if (conn.responseCode == 200) {
-                                        bitmaps[idx] = BitmapFactory.decodeStream(conn.inputStream)
+                                        bitmaps[idx] = BitmapFactory.decodeStream(conn.inputStream, null, opts)
                                     }
                                 } catch (_: Exception) {
                                 } finally {
@@ -727,23 +853,50 @@ object SpeedTestPanel {
                         }.apply { isDaemon = true }.start()
                     }
                     latch.await()
-                    if (bitmaps.any { it == null }) return@Thread
+                    if (bitmaps.any { it == null }) {
+                        handler.post {
+                            if (mg != mapGen) return@post
+                            try { mapView.onTilesFailed() } catch (_: Exception) {}
+                        }
+                        return@Thread
+                    }
                     val stitched = Bitmap.createBitmap(
-                        plan.stitchedW, plan.stitchedH, Bitmap.Config.ARGB_8888)
+                        plan.stitchedW, plan.stitchedH, Bitmap.Config.RGB_565)
                     val cv = Canvas(stitched)
                     for ((idx, t) in plan.tiles.withIndex()) {
                         val b = bitmaps[idx] ?: return@Thread
                         cv.drawBitmap(b, t.dx.toFloat(), t.dy.toFloat(), null)
                     }
-                    val cropped = Bitmap.createBitmap(
-                        stitched, plan.cropX, plan.cropY, plan.cropW, plan.cropH)
-                    val g2 = gen
                     handler.post {
-                        if (g2 != gen) return@post
-                        try { mapImage.setImageBitmap(cropped) } catch (_: Exception) {}
+                        if (mg != mapGen) return@post
+                        mapShownKey = key
+                        // Cache the stitch (max 2 zooms): evict the
+                        // eldest NON-displayed entry — never recycle
+                        // the bitmap the view is showing.
+                        tileCache[zoom] = CachedTiles(stitched, plan, panX, panY)
+                        while (tileCache.size > 2) {
+                            val victim = tileCache.entries.firstOrNull {
+                                it.value.stitched !== displayedStitched
+                            } ?: break
+                            tileCache.remove(victim.key)
+                            try {
+                                if (!victim.value.stitched.isRecycled) {
+                                    victim.value.stitched.recycle()
+                                }
+                            } catch (_: Exception) {}
+                        }
+                        displayedStitched = stitched
+                        try {
+                            mapView.showTiles(stitched, plan, zoom, panX, panY)
+                            refreshZoomButtons()
+                        } catch (_: Exception) {}
                     }
                 } catch (_: Exception) {
                     // Tiles failed: the placeholder stays.
+                    handler.post {
+                        if (mg != mapGen) return@post
+                        try { mapView.onTilesFailed() } catch (_: Exception) {}
+                    }
                 }
             }.apply { isDaemon = true }.start()
         }

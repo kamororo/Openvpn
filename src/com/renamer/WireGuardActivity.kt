@@ -650,6 +650,28 @@ class WireGuardActivity : Activity() {
                 if (warpRec != null) warpConnect(warpRec)
             }
         }
+        // 1.74 (C): the home last-connection card's reconnect
+        // for free warp (QuickConnect M_WARP branch). Same
+        // guard shape as the widget block above — never
+        // restart a live session — and the EXACT record only:
+        // the id first, then the recorded card name (a
+        // re-fetch replaces the record's id but keeps its
+        // name). Neither matches -> the page just opens and
+        // the user picks; never connect a different record.
+        // warpConnect itself is the page's own path (aether
+        // session tunnel / IP replacement / traffic verify).
+        val warpAutoId = intent.getStringExtra("warp_auto_connect_id")
+        val warpAutoName = intent.getStringExtra("warp_auto_connect_name")
+        if ((warpAutoId?.isNotBlank() == true || warpAutoName?.isNotBlank() == true) &&
+            !isWgUp() && !isAnyWarpUp()
+        ) {
+            val warpRec = warpRecords.firstOrNull { it.id == warpAutoId }
+                ?: WarpLastConnectPure.resolve(
+                    warpRecords.map { WarpLastConnectPure.WarpRef(it.id, it.name) },
+                    warpAutoName
+                )?.let { ref -> warpRecords.firstOrNull { it.id == ref.id } }
+            if (warpRec != null) warpConnect(warpRec)
+        }
     }
 
     override fun onResume() {
@@ -2680,6 +2702,15 @@ class WireGuardActivity : Activity() {
                 if (ok) {
                     warpWgVerified = true
                     WarpFree.setActiveId(this, rec.id)
+                    // 1.74 (C): the WG rung's real-traffic
+                    // verdict passed — free warp is the card's
+                    // last connection now, with the record's
+                    // card name ("free warp"). The plain-WG
+                    // verify above deliberately never records
+                    // a warp tunnel (1.48), and this branch
+                    // recorded nothing at all, so the card
+                    // never saw a WG-rung warp connect.
+                    try { QuickConnect.record(this, QuickConnect.M_WARP, rec.name) } catch (_: Exception) {}
                     warpConnecting = false
                     AppLog.append(this, "warp",
                         "[✓] «${rec.name}» وصل شد؛ ترافیک واقعی رد شد.",

@@ -60,6 +60,11 @@ open class SectionWidgetProvider : AppWidgetProvider() {
 
         fun iconAssetFor(key: String): String? = when (key) {
             "v2ray" -> "vpn.png"
+            // 1.74 (C): free warp lives in the WireGuard
+            // page — the last-connection widget shows the
+            // WG icon for it (before this the warp method
+            // fell to null here and the widget had no icon).
+            "warp" -> "wg.png"
             "wireguard" -> "wg.png"
             "openvpn" -> "ovpn.png"
             "emergency" -> "emergency.png"

@@ -414,6 +414,16 @@ class VpnClientService : VpnService(), libv2ray.CoreCallbackHandler {
                     VpnNotification.showConnected(this, "warp",
                         notifName ?: currentName ?: "", notifHost, currentLink)
                 } catch (_: Throwable) {}
+                // 1.74 (C): the real-traffic verify passed — ONLY
+                // NOW does free warp become the card's last
+                // connection, with the record's card name
+                // ("free warp") as the config. The start hook
+                // below deliberately still skips warp (1.45):
+                // an unproven session must never be the last
+                // method, and its "WARP::<id>" link is not a
+                // display name. The WG rung has no service, so
+                // its own verdict records it in WireGuardActivity.
+                try { QuickConnect.record(this, QuickConnect.M_WARP, currentName) } catch (_: Exception) {}
             }
             return START_NOT_STICKY
         }
@@ -437,10 +447,18 @@ class VpnClientService : VpnService(), libv2ray.CoreCallbackHandler {
         // method that just started (hydra is recorded
         // by HydraService.start instead; this hook
         // covers v2ray / emergency / smart / chain).
-        // 1.45: warp is NOT a QuickConnect method —
-        // recording it would make the quick-connect
-        // card fall back to Emergency on reconnect.
-        // The card keeps the previous method instead.
+        // 1.45/1.74 (C): warp is NOT recorded here — a
+        // session that only just started has passed no
+        // real traffic yet, and its "WARP::<id>" link
+        // is not a card name. A VERIFIED warp session
+        // records itself at WARP_VERIFIED above (and
+        // the WG rung at its own verdict), with the
+        // record's card name ("free warp"). Before
+        // 1.74 the card had no warp branch at all, so
+        // recording here would have fallen back to
+        // Emergency on reconnect; now the branch
+        // exists, but the start hook stays skipped on
+        // purpose — only a proven warp is last.
         if (sessionTag != "warp") {
             try { QuickConnect.recordServiceStart(this, sessionTag, currentLink, null) } catch (_: Exception) {}
         }

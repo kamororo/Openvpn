@@ -42,10 +42,12 @@ object FreeConfigs {
     // list (BundledRelays) no longer uses these
     // constants at all — the 1.66 pool that reused
     // them through subUrls() below is deleted.
-    private val SUB_URLS = listOf("https://example.com/subscription-1",
+    private val SUB_URLS = listOf(
+        "https://example.com/subscription-1",
         "https://example.com/subscription-2",
         "https://example.com/subscription-3",
-        "https://example.com/subscription-4")
+        "https://example.com/subscription-4"
+    )
 
     /** The sub URLs for the free-config fetch —
      *  the same constants, never a copy, never

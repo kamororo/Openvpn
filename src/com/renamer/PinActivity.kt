@@ -20,9 +20,9 @@ import android.widget.*
  * normal keypad for any calculation.
  *
  * Secret unlock: PINs end with "=":
- *   1324 =   -> private (all sections)
+ *   1111 =   -> private (all sections)
  *   0000 =   -> public (public section only)
- *   = 1324 = -> private
+ *   = 1111 = -> private
  *   = 0000 = -> public
  * Anything else just calculates; no PIN is ever named on
  * this page, and a wrong code simply shows its result.
@@ -364,20 +364,20 @@ class PinActivity : Activity() {
 
     private fun onEquals() {
         // "=" with nothing typed just arms the next code
-        // entry (the first "=" of "= 1324 =").
+        // entry (the first "=" of "= 1111 =").
         if (expr.isEmpty()) {
             justEvaluated = true
             refreshDisplay()
             return
         }
         // Secret codes: a bare number, typed either as
-        // "1324 =" or after a previous "=" ("= 1324 =").
+        // "1111 =" or after a previous "=" ("= 1111 =").
         // Fix: after an evaluation, the displayed
         // result is NOT a freshly typed code. A second
         // "=" must never re-check it as a PIN -- a code
         // counts only when typed since the last
         // evaluation (digit entry already clears
-        // justEvaluated, and the "= 1324 =" arming
+        // justEvaluated, and the "= 1111 =" arming
         // press returns early above, so justEvaluated
         // here can only mean "this value is an
         // evaluation result").

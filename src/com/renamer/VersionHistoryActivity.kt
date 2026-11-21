@@ -15,7 +15,7 @@ import android.widget.*
  * versions), and picking one closes the sheet and
  * shows ONLY that version's changes, numbered.
  *
- * Only the CURRENT version is kept (1.73, user
+ * Only the CURRENT version is kept (1.74, user
  * order): previous versions' info was deleted.
  * When a new version is added, replace this
  * entry — do not re-add old ones.
@@ -35,24 +35,20 @@ class VersionHistoryActivity : Activity() {
 
     // UPDATE WITH EVERY BUILD — keep ONLY the current version's entry.
     // با هر بیلد به‌روز کن — فقط همین یک ورژن بماند؛ ورژن قبلی را حذف کن.
-    // 1.73 (user order): previous versions' info deleted; history holds
+    // 1.74 (user order): previous versions' info deleted; history holds
     // this version only.
     private val VERSIONS = listOf(
-        VersionEntry("1.73", 74,
-            "بخش تست سرعت به صفحه اصلی آمد، باکس تست سرعت حذف شد، حالت شب حدود ۳۰٪ تیره‌تر شد، بررسی بروزرسانی اضافه شد و باگ مصرف نشست وارپ رفع شد",
+        VersionEntry("1.74", 75,
+            "نقشه تست سرعت زوم‌دار و کامل شد، آیکن تست سرعت کیلومترشمار شد و آخرین اتصال وارپ رایگان را تشخیص می‌دهد",
             listOf(
-                "بخش «تست سرعت» به صفحه اصلی اضافه شد: کاشی هفتم در شبکه اصلی که یک پنل شناور باز می‌کند؛ سرعت دانلود و آپلود و پینگ را روی همان تونلی که وصل است اندازه می‌گیرد",
-                "باکس «تست سرعت و مانیتورینگ» از صفحه اصلی برداشته شد؛ تست سرعت حالا فقط از کاشی جدید انجام می‌شود",
-                "حالت شب حدود ۳۰٪ تیره‌تر شد: همه صفحه‌ها — شامل صفحه اصلی، هاله شب، کاشی‌ها و نوار پایینی — با همان نسبت تیره شدند",
-                "بررسی بروزرسانی: گزینه جدید در انتهای تنظیمات و بررسی خودکار هنگام باز شدن برنامه؛ اگر نسخه جدید در گیت‌هاب باشد، دانلود و نصب از داخل برنامه انجام می‌شود.",
-                "رفع باگ مصرف نشست وارپ: مصرف نشست‌های وارپ (MASQUE) صفر نشان داده می‌شد چون شمارنده‌های تونل (tun0) ترافیک موتور aether را نمی‌بینند؛ حالا مصرف از شمارنده‌های خود برنامه خوانده می‌شود و نمودار سرعت زنده هم از همان عدد می‌آید."
+                "نقشه تست سرعت حالا زوم‌دار است: با دو انگشت یا دکمه‌های + و − می‌توانی از ۱۱ تا ۱۶ زوم کنی و نقشه را بکشی؛ سنجاق روی همان مکان می‌ماند و نقشه کامل است",
+                "آیکن «تست سرعت» در صفحه اصلی و بالای پنل تست سرعت به کیلومترشمار (گیج سرعت) تغییر کرد؛ آیکن مانیتورینگ در نوار پایینی و ویجت همان قبلی است",
+                "«آخرین اتصال» حالا اتصال وارپ رایگان را هم تشخیص می‌دهد: بعد از وصل شدن وارپ رایگان، کارت آخرین اتصال آن را نشان می‌دهد و با زدن آن دوباره به همان وارپ وصل می‌شوی"
             ),
             listOf(
-                "A «Speed test» section was added to the home page: a seventh tile in the main grid that opens a floating panel; it measures download and upload speed and ping over the tunnel that is connected",
-                "The «Speed test & monitoring» box was removed from the home page; speed testing now happens only from the new tile",
-                "Night mode is about 30% darker: every page — including the home page, the night aurora, the tiles and the bottom bar — was darkened by the same factor",
-                "Update checker: a new option at the end of Settings plus an automatic check on launch; when a newer version is on GitHub, it downloads and installs from inside the app.",
-                "Fixed warp session usage showing 0: MASQUE sessions read 0 because the tunnel counters (tun0) never see the aether engine's traffic; usage now comes from the app's own UID counters, and the live speed graph is fed by the same numbers."
+                "The speed-test map is now zoomable and complete: pinch or use the + and − buttons to zoom from 11 to 16 and drag the map; the pin stays on the same location and the map is complete",
+                "The «Speed test» icon on the home page and at the top of the speed-test panel is now a speedometer (gauge); the monitoring icon in the bottom bar and the widget is unchanged",
+                "«Last connection» now recognises a Free WARP connection too: after connecting Free WARP, the last-connection card shows it and tapping it reconnects to the same WARP"
             )),
     )
     private lateinit var contentBox: LinearLayout

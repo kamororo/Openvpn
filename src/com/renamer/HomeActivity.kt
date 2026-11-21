@@ -591,10 +591,17 @@ class HomeActivity : Activity() {
             // 2.82: the tile background is now a TileBackgroundDrawable
             // (gradient border in night); the GradientDrawable branch is
             // kept only as a defensive fallback.
+            // 1.74 (C): free warp lives in the WireGuard
+            // page, so a live warp connection greens the
+            // wireguard tile (method "warp" has no tile
+            // of its own). Every other method keeps its
+            // own tile exactly as before.
+            val connected = live && (method == key ||
+                (key == "wireguard" && method == QuickConnect.M_WARP))
             when (val bg = cell.background) {
-                is HomeIcons.TileBackgroundDrawable -> bg.setConnected(live && method == key)
+                is HomeIcons.TileBackgroundDrawable -> bg.setConnected(connected)
                 is android.graphics.drawable.GradientDrawable ->
-                    bg.setStroke(w, if (live && method == key) green else faint)
+                    bg.setStroke(w, if (connected) green else faint)
             }
         }
     }
